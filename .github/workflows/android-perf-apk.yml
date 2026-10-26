@@ -461,11 +461,18 @@ jobs:
           if [ -n "${SWIFT_NDK:-}" ] && [ -d "$SWIFT_NDK" ]; then NDK_ROOT="$SWIFT_NDK"; fi
           NEWEST="$(ls -1 "$ANDROID_HOME/ndk" 2>/dev/null | sort -V | tail -1)"
           [ -n "$NEWEST" ] && NDK_ROOT="$ANDROID_HOME/ndk/$NEWEST"
+          # The Swift SDK's destination JSON consults both variables when it expands its sysroot.
+          # setup-android-sdk.sh only needs HOME, but leaving the job's inherited ROOT on r28 makes
+          # `swift build` silently pass --sysroot .../ndk/28 even after the bundle was set up with r30.
+          export ANDROID_NDK_HOME="$NDK_ROOT"
+          export ANDROID_NDK_ROOT="$NDK_ROOT"
           echo "NDK root: $NDK_ROOT"
+          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
+          echo "ANDROID_NDK_ROOT: $ANDROID_NDK_ROOT"
           echo "NDKs present: $(ls -1 "$ANDROID_HOME/ndk" 2>/dev/null | tr '\n' ' ')"
           # The bundle cross-compiles against an NDK sysroot its setup script links in.
           if [ -f "$BUNDLE/swift-android/scripts/setup-android-sdk.sh" ]; then
-            ANDROID_NDK_HOME="$NDK_ROOT" bash "$BUNDLE/swift-android/scripts/setup-android-sdk.sh" >/tmp/ndk-setup.log 2>&1 \
+            bash "$BUNDLE/swift-android/scripts/setup-android-sdk.sh" >/tmp/ndk-setup.log 2>&1 \
               || report /tmp/ndk-setup.log
           else
             echo "no setup-android-sdk.sh in the bundle" >>/tmp/ndk-setup.log
@@ -499,6 +506,7 @@ jobs:
           LIBCXX="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a"
           { swift --version; echo "bundle: $BUNDLE"; swift sdk list --swift-sdks-path "$SDK_ROOT"
             echo "ndk root: $NDK_ROOT"; echo "ndks: $(ls -1 "$ANDROID_HOME/ndk" | tr '\n' ' ')"
+            echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"; echo "ANDROID_NDK_ROOT: $ANDROID_NDK_ROOT"
             echo "libc++: $LIBCXX"
             echo "libc++ has __hash_memory: $(grep -c __hash_memory "$LIBCXX" 2>/dev/null || echo 0)"
             echo "bundle sysroot: $(readlink -f "$BUNDLE/swift-android/ndk-sysroot" 2>/dev/null)"
