@@ -340,7 +340,7 @@ private fun ColumnScope.FilesStep(state: PrepareState, busy: Boolean, onDownload
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Jailbreak with Cydia", style = MaterialTheme.typography.titleSmall)
-                Text("Adds Cydia, apt and dpkg, Substrate (the tweak loader, iOS 3 to 6) and afc2, which serves the whole file system over USB. The first start finishes the install.",
+                Text("Adds Cydia, apt and dpkg, ${if (firmware.version.startsWith("3.")) "and afc2" else "Substrate (the tweak loader) and afc2"}, which serves the whole file system over USB. The first start finishes the install.",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Switch(checked = state.jailbreak, onCheckedChange = onJailbreak, enabled = !busy && !CydiaBootstrap.running,

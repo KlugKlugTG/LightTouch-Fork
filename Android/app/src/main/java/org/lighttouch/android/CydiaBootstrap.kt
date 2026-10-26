@@ -13,8 +13,8 @@ import java.security.MessageDigest
 /**
  * Cydia's bootstrap: the archives a jailbroken preparation installs (`firmwarekit create --jailbreak`, the
  * SystemEdits.Cydia of Packages/FirmwareKit, which pins them and their SHA-1s). saurik's freeze.tar as Legacy iOS
- * Kit ships it (Cydia 1.1.30, apt, dpkg, bash and the base packages), Substrate's Safe Mode extension and Cydia
- * HTTPatch for iOS 3.
+ * Kit ships it (Cydia 1.1.30, apt, dpkg, bash and the base packages), plus the pinned Substrate and HTTPatch
+ * archives used where the selected iOS version supports them. FirmwareKit deliberately leaves both out on iOS 3.
  *
  * The phone downloads them into the folder firmwarekit reads them from: the "Jailbreak" folder beside the cache it
  * prepares with (cacheDir/firmwarekit for FirmwareService, so cacheDir/Jailbreak here). firmwarekit checks each
