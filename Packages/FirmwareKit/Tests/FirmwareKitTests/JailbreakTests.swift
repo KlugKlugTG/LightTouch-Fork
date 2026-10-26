@@ -233,6 +233,68 @@ struct CydiaInstallTests {
         #expect(SystemEdits.bootstrapHardLink("hrwxr-xr-x root/wheel 0 2013-09-03 09:59 ./bin/a link to ../outside") == nil)
     }
 
+    @Test func hardLinksAreReadFromCompressedArchiveHeaders() throws {
+        let dir = fm.temporaryDirectory.appendingPathComponent("ltm-cydia-\(UUID())")
+        defer { try? fm.removeItem(at: dir) }
+        let links = try SystemEdits.bootstrapArchiveHardLinks(bootstrap(in: dir))
+        #expect(links.count == 1)
+        let link = try #require(links.first)
+        #expect(Set([link.path, link.target]) == ["bin/bash-alias", "bin/bash"])
+    }
+
+    @Test func longHardLinkNamesAreReadFromArchiveHeaders() throws {
+        let dir = fm.temporaryDirectory.appendingPathComponent("ltm-cydia-\(UUID())")
+        defer { try? fm.removeItem(at: dir) }
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let target = String(repeating: "a", count: 120) + "-target"
+        let alias = String(repeating: "b", count: 120) + "-alias"
+        try Data("contents".utf8).write(to: dir.appendingPathComponent(target))
+        try fm.linkItem(at: dir.appendingPathComponent(target), to: dir.appendingPathComponent(alias))
+        let archive = dir.appendingPathComponent("links.tar")
+        let process = try Process.run(URL(fileURLWithPath: "/usr/bin/tar"),
+            arguments: ["-cf", archive.path, "-C", dir.path, target, alias])
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+        let links = try SystemEdits.bootstrapArchiveHardLinks(archive)
+        #expect(links.count == 1)
+        #expect(links.first?.path == alias)
+        #expect(links.first?.target == target)
+    }
+
+    @Test func archiveHardLinksCannotLeaveTheVolume() throws {
+        let dir = fm.temporaryDirectory.appendingPathComponent("ltm-cydia-\(UUID())")
+        defer { try? fm.removeItem(at: dir) }
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var header = [UInt8](repeating: 0, count: 512)
+        header.replaceSubrange(0..<7, with: "./bin/a".utf8)
+        header[156] = 49
+        header.replaceSubrange(157..<167, with: "../outside".utf8)
+        header.replaceSubrange(148..<156, with: repeatElement(UInt8(32), count: 8))
+        let sum = String(header.reduce(0) { $0 + Int($1) }, radix: 8)
+        header.replaceSubrange(148..<156, with: (String(repeating: "0", count: 6 - sum.count) + sum + "\0 ").utf8)
+        let archive = dir.appendingPathComponent("links.tar")
+        try (Data(header) + Data(repeating: 0, count: 1024)).write(to: archive)
+        #expect(throws: FirmwareError.self) { try SystemEdits.bootstrapArchiveHardLinks(archive) }
+        try Data([120]).write(to: archive)
+        #expect(throws: FirmwareError.self) { try SystemEdits.bootstrapArchiveHardLinks(archive) }
+    }
+
+    @Test func realBootstrapHardLinksAreCopiedWithoutLinkSyscalls() throws {
+        guard let path = ProcessInfo.processInfo.environment["LT_CYDIA_REAL_BOOTSTRAP"] else { return }
+        let dir = fm.temporaryDirectory.appendingPathComponent("ltm-cydia-\(UUID())")
+        defer { try? fm.removeItem(at: dir) }
+        let m = try firmware(in: dir, prefs: nil, version: "5.1.1")
+        let archive = URL(fileURLWithPath: path)
+        let links = try SystemEdits.bootstrapArchiveHardLinks(archive)
+        #expect(links.contains { $0.path == "bin/gunzip" && $0.target == "bin/uncompress" })
+        _ = try SystemEdits.installCydia(m, bootstrap: archive, copyHardLinks: true)
+        let original = m.appendingPathComponent("bin/uncompress")
+        let alias = m.appendingPathComponent("bin/gunzip")
+        #expect(try Data(contentsOf: original) == Data(contentsOf: alias))
+        #expect(try fm.attributesOfItem(atPath: original.path)[.systemFileNumber] as? NSNumber
+            != fm.attributesOfItem(atPath: alias.path)[.systemFileNumber] as? NSNumber)
+    }
+
     @Test func manyExistingFilesDoNotBlockExtraction() throws {
         let dir = fm.temporaryDirectory.appendingPathComponent("ltm-cydia-\(UUID())")
         defer { try? fm.removeItem(at: dir) }
@@ -459,9 +521,8 @@ struct CydiaInstallTests {
         #expect(r.mobile.isEmpty, "mobile's own preferences keep their owner")
     }
 
-    /// Substrate's AutoInstall package on 3.x to 6.x and HTTPatch's on 3.x, as Legacy iOS Kit's restores add them
-    /// (and 6.x, which its restores leave to Cydia); none on 7.x; Patcyh (iOS 8.3 and later) out of the files and
-    /// dpkg's records everywhere.
+    /// Substrate's AutoInstall package on 4.x to 6.x; none on 3.x, whose subsequent emulated boots cannot survive
+    /// Substrate's system-wide launchd insertion, or 7.x. Patcyh stays out of the files and dpkg records everywhere.
     @Test(arguments: ["3.1.3", "4.2.1", "5.1.1", "6.1.6", "7.1.2"])
     func substrateAndHTTPatchByVersion(_ version: String) throws {
         let dir = fm.temporaryDirectory.appendingPathComponent("ltm-cydia-\(UUID().uuidString)")
@@ -471,7 +532,7 @@ struct CydiaInstallTests {
         let major = Int(version.prefix(1)) ?? 0
         let auto = "private/var/root/Media/Cydia/AutoInstall/"
         for (deb, wanted) in [
-            ("mobilesubstrate_fix.deb", (3...6).contains(major)), ("cydiahttpatch-1.0.deb", major == 3),
+            ("mobilesubstrate_fix.deb", (4...6).contains(major)), ("cydiahttpatch-1.0.deb", false),
         ] {
             #expect(fm.fileExists(atPath: m.appendingPathComponent(auto + deb).path) == wanted, "\(version): \(deb)")
             #expect(r.root.contains(auto + deb) == wanted, "\(version): \(deb) is root's")

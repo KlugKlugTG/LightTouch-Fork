@@ -54,7 +54,7 @@ import Testing
             try environment(plain)["DYLD_INSERT_LIBRARIES"] as? String
                 == "/usr/lib/it_typein.dylib:/usr/lib/other.dylib"
         )
-        let n72 = try firmware(in: dir.appendingPathComponent("n72"), version: "3.1.3")
+        let n72 = try firmware(in: dir.appendingPathComponent("n72"), version: "4.2.1")
         let s = try SystemEdits.installJailbreak(n72, bootstrap: bootstrap, typeinBySubstrate: true)
         #expect(try environment(n72)["DYLD_INSERT_LIBRARIES"] as? String == "/usr/lib/other.dylib")
         let ext = "Library/MobileSubstrate/DynamicLibraries/it_typein"
@@ -64,6 +64,20 @@ import Testing
         )
         #expect(fm.fileExists(atPath: n72.appendingPathComponent(ext + ".plist").path))
         #expect(s.root.contains(ext + ".dylib") && s.root.contains(ext + ".plist"))
+    }
+
+    @Test func ios3DisablesTypeinWithoutInstallingSubstrate() throws {
+        let dir = fm.temporaryDirectory.appendingPathComponent("ltm-jb-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: dir) }
+        let root = try firmware(in: dir, version: "3.1.3")
+        let result = try SystemEdits.installJailbreak(
+            root, bootstrap: CydiaInstallTests().bootstrap(in: dir), typeinBySubstrate: true
+        )
+        #expect(try environment(root)["DYLD_INSERT_LIBRARIES"] as? String == "/usr/lib/other.dylib")
+        let ext = "Library/MobileSubstrate/DynamicLibraries/it_typein"
+        #expect(!fm.fileExists(atPath: root.appendingPathComponent(ext + ".dylib").path))
+        #expect(!fm.fileExists(atPath: root.appendingPathComponent(ext + ".plist").path))
+        #expect(!result.root.contains(ext + ".dylib") && !result.root.contains(ext + ".plist"))
     }
 
     @Test func kbootTakesTheJailbrokenBootArgsOnce() throws {

@@ -13,10 +13,10 @@
 // cydiasubstrate.tar puts its .debs in Cydia's AutoInstall folder, which the Startup job installs with dpkg on the
 // first boot. Its install script starts Substrate in launchd at once and, below iOS 7, for every later boot through
 // /etc/launchd.conf (bsexec .. cynject 1 SubstrateLauncher.dylib), so every job launchd starts, SpringBoard and the
-// apps among them, loads Substrate. Legacy iOS Kit adds it for 3.x to 5.x; 6.x takes the same package (its restores
-// leave Substrate to Cydia there). 7.x gets none: its root stays read-only (no dpkg at boot), and on 7.x the script
-// starts Substrate only from /etc/rc.d, which only a jailbreak's untether runs. On 3.x Cydia HTTPatch
-// (cydiahttpatch.tar, a Substrate extension) points Cydia at http, as 3.x's TLS can't reach its repositories.
+// apps among them, loads Substrate. It is installed on 4.x to 6.x. On the emulated iPod touch 2G / iOS 3.1.3,
+// installing it on the first boot makes every later boot stop immediately after iBoot hands off to the kernel, so
+// 3.x keeps Cydia and its HTTP sources without Substrate or HTTPatch. 7.x gets none: its root stays read-only (no
+// dpkg at boot), and on 7.x the script starts Substrate only from /etc/rc.d, which only an untether runs.
 // Patcyh, a Substrate extension for lsd and installd that freeze.tar carries for iOS 8.3 and later, comes out, as
 // Legacy iOS Kit takes it out below 8.3.
 //
@@ -65,7 +65,7 @@ extension SystemEdits {
             "http://apt.thebigboss.org/repofiles/cydia/", "http://modmyi.saurik.com/",
             "http://zodttd.saurik.com/repo/cydia/",
         ]
-        static let substrateMajors = 3...6
+        static let substrateMajors = 4...6
         static let springBoardPrefs = "private/var/mobile/Library/Preferences/com.apple.springboard.plist"
         static let patcyh = [
             "Library/MobileSubstrate/DynamicLibraries/patcyh.dylib",
@@ -124,19 +124,28 @@ extension SystemEdits {
                     .filter { $0 != "/" + typein }
                 env["DYLD_INSERT_LIBRARIES"] = libs.isEmpty ? nil : libs.joined(separator: ":")
             }
-            let dir = "Library/MobileSubstrate/DynamicLibraries"
-            try mkdirs(m.appendingPathComponent(dir))
-            try? FileManager.default.removeItem(at: m.appendingPathComponent(dir + "/it_typein.dylib"))
-            try FileManager.default.createSymbolicLink(
-                atPath: m.appendingPathComponent(dir + "/it_typein.dylib").path,
-                withDestinationPath: "/" + typein
-            )
-            try put(
-                Data(#"{ Filter = { Bundles = ( "com.apple.springboard" ); }; }"#.utf8),
-                m.appendingPathComponent(dir + "/it_typein.plist"),
-                mode: 0o644
-            )
-            root += ["Library/MobileSubstrate", dir, dir + "/it_typein.dylib", dir + "/it_typein.plist"]
+            // Cydia's cydo refuses a parent with DYLD_INSERT_LIBRARIES. On 4.x-6.x the first boot installs
+            // Substrate from AutoInstall, which then loads typein without that variable. On 3.x Substrate is
+            // deliberately absent, so typein stays disabled.
+            let major = Int(
+                (NSDictionary(contentsOf: m.appendingPathComponent("System/Library/CoreServices/SystemVersion.plist"))?["ProductVersion"]
+                    as? String ?? "").split(separator: ".").first ?? ""
+            ) ?? 0
+            if Cydia.substrateMajors.contains(major) {
+                let dir = "Library/MobileSubstrate/DynamicLibraries"
+                try mkdirs(m.appendingPathComponent(dir))
+                try? FileManager.default.removeItem(at: m.appendingPathComponent(dir + "/it_typein.dylib"))
+                try FileManager.default.createSymbolicLink(
+                    atPath: m.appendingPathComponent(dir + "/it_typein.dylib").path,
+                    withDestinationPath: "/" + typein
+                )
+                try put(
+                    Data(#"{ Filter = { Bundles = ( "com.apple.springboard" ); }; }"#.utf8),
+                    m.appendingPathComponent(dir + "/it_typein.plist"),
+                    mode: 0o644
+                )
+                root += ["Library/MobileSubstrate", dir, dir + "/it_typein.dylib", dir + "/it_typein.plist"]
+            }
         }
         return (afc2.line, cydia.line, root, cydia.mobile, cydia.modes + installer.modes)
     }
@@ -165,7 +174,7 @@ extension SystemEdits {
         func link(_ rel: String) -> Bool {
             (try? fm.destinationOfSymbolicLink(atPath: m.appendingPathComponent(rel).path)) != nil
         }
-        // Substrate on 3.x to 6.x, HTTPatch on 3.x
+        // Substrate on 4.x to 6.x. The 3.x HTTPatch depends on Substrate, so both stay out there.
         let major =
             Int(
                 (NSDictionary(contentsOf: m.appendingPathComponent("System/Library/CoreServices/SystemVersion.plist"))?[
@@ -174,7 +183,7 @@ extension SystemEdits {
             ) ?? 0
         let packages = [
             (Cydia.files[0].name, true), (Cydia.files[1].name, Cydia.substrateMajors.contains(major)),
-            (Cydia.files[2].name, major == 3),
+            (Cydia.files[2].name, false),
         ].filter(\.1).map { bootstrap.deletingLastPathComponent().appendingPathComponent($0.0) }
         var entries: [String] = []
         var special: [(path: String, mode: UInt16)] = []
@@ -184,7 +193,7 @@ extension SystemEdits {
                 $0 != Cydia.excluded && !$0.hasPrefix(Cydia.excluded + "/")
             }
             let verbose = try tar(["-tvf", p.path]).split(separator: "\n")
-            archiveLinks.append(copyHardLinks ? verbose.compactMap { Self.bootstrapHardLink(String($0)) } : [])
+            archiveLinks.append(copyHardLinks ? try Self.bootstrapArchiveHardLinks(p) : [])
             for line in verbose {
                 if let entry = Self.specialMode(String(line)) { special.append(entry) }
             }
