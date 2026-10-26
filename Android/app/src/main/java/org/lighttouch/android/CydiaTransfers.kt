@@ -15,10 +15,14 @@ import java.security.MessageDigest
 
 internal data class GuestDeb(val name: String, val path: String, val bytes: Long)
 
+/** Progress for a .deb transfer and its guest installation. */
+internal data class CydiaTransferJob(val name: String, val phase: String, val progress: Float? = null, val error: String? = null,
+                                     val done: Boolean = false, val cancellable: Boolean = false)
+
 /** Transfers survive an activity recreation. Android holds only a temporary copy, removed after every attempt. */
 internal object CydiaTransfers {
     private val handler = Handler(Looper.getMainLooper())
-    var job by mutableStateOf<InstallJob?>(null); private set
+    var job by mutableStateOf<CydiaTransferJob?>(null); private set
     var active by mutableStateOf(false); private set
     var files by mutableStateOf<List<GuestDeb>>(emptyList()); private set
     var loading by mutableStateOf(false); private set
@@ -59,7 +63,7 @@ internal object CydiaTransfers {
         fetchPackage(p, target, report); DebArchive.name(p.download.substringBefore('?').substringAfterLast('/'))
     }
 
-    private fun fetchPackage(p: AptPackage, target: File, report: (InstallJob) -> Unit) {
+    private fun fetchPackage(p: AptPackage, target: File, report: (CydiaTransferJob) -> Unit) {
         try { AptNetwork.fetch(p.download) { input, total, _ -> copy(input, target, total, "Downloading ${p.name}", report) } }
         catch (failure: Exception) { throw IllegalStateException("${p.name}: ${failure.message}", failure) }
         p.fields["Size"]?.toLongOrNull()?.let { check(target.length() == it) { "${p.name}: package size does not match the repository index." } }
@@ -71,13 +75,13 @@ internal object CydiaTransfers {
         }
     }
 
-    private fun installSaved(apps: GuestApps, socket: String, name: String, label: String, report: (InstallJob) -> Unit): String {
+    private fun installSaved(apps: GuestApps, socket: String, name: String, label: String, report: (CydiaTransferJob) -> Unit): String {
         val token = UUID.randomUUID().toString().replace("-", "")
         apps.run(socket, listOf("deb-queue", "--deb-name", name, "--token", token), 60)
         val deadline = System.nanoTime() + 900_000_000_000L
         var transientFailures = 0
         while (System.nanoTime() < deadline) {
-            report(InstallJob(label, "Installing in iOS"))
+            report(CydiaTransferJob(label, "Installing in iOS"))
             val attempt = runCatching { apps.run(socket, listOf("deb-status", "--token", token), 30) }
             if (attempt.isFailure) {
                 check(++transientFailures < 6) { "Lost connection to iOS. Installation result is unconfirmed; refresh Installed after reconnecting." }
@@ -95,14 +99,14 @@ internal object CydiaTransfers {
     fun installFile(context: Context, socket: String, file: GuestDeb) {
         if (active) return
         val app = context.applicationContext
-        active = true; job = InstallJob(file.name, "Connecting to iOS")
+        active = true; job = CydiaTransferJob(file.name, "Connecting to iOS")
         Thread({
-            val report: (InstallJob) -> Unit = { next -> handler.post { job = next } }
+            val report: (CydiaTransferJob) -> Unit = { next -> handler.post { job = next } }
             val outcome = runCatching {
                 DownloadService.hold(app, "Installing .deb in iOS")
                 val log = installSaved(GuestApps(app), socket, file.name, file.name, report)
-                InstallJob(file.name, "Installed in iOS" + if (log.contains("Icon cache refresh failed")) ". Restart iOS to refresh icons." else "", 1f, done = true)
-            }.getOrElse { InstallJob(file.name, "", error = it.message) }
+                CydiaTransferJob(file.name, "Installed in iOS" + if (log.contains("Icon cache refresh failed")) ". Restart iOS to refresh icons." else "", 1f, done = true)
+            }.getOrElse { CydiaTransferJob(file.name, "", error = it.message) }
             DownloadService.release(app)
             handler.post { active = false; job = outcome; refresh(app, socket) }
         }, "cydia-install-saved").start()
@@ -120,7 +124,7 @@ internal object CydiaTransfers {
 
     fun download(context: Context, socket: String, link: String) {
         val address = try { DebArchive.address(link) } catch (failure: Exception) {
-            if (!active) job = InstallJob("Download .deb", "", error = failure.message)
+            if (!active) job = CydiaTransferJob("Download .deb", "", error = failure.message)
             return
         }
         transfer(context, socket, "Download .deb") { _, target, report ->
@@ -155,7 +159,7 @@ internal object CydiaTransfers {
         }
     }
 
-    private fun copy(input: InputStream, target: File, total: Long, phase: String, report: (InstallJob) -> Unit) {
+    private fun copy(input: InputStream, target: File, total: Long, phase: String, report: (CydiaTransferJob) -> Unit) {
         target.outputStream().use { output ->
             val buffer = ByteArray(64 * 1024)
             var copied = 0L; var lastReport = 0L
@@ -167,7 +171,7 @@ internal object CydiaTransfers {
                 output.write(buffer, 0, count)
                 val now = System.nanoTime()
                 if (now - lastReport > 100_000_000) {
-                    report(InstallJob(target.name, "$phase · ${byteSize(copied)}",
+                    report(CydiaTransferJob(target.name, "$phase · ${byteSize(copied)}",
                         if (total > 0) (copied.toFloat() / total).coerceIn(0f, 1f) else null, cancellable = true))
                     lastReport = now
                 }
@@ -177,20 +181,20 @@ internal object CydiaTransfers {
     }
 
     private fun transfer(context: Context, socket: String, label: String, expected: AptPackage? = null,
-                         source: (Context, File, (InstallJob) -> Unit) -> String) {
+                         source: (Context, File, (CydiaTransferJob) -> Unit) -> String) {
         if (active) return
         val app = context.applicationContext
-        active = true; cancelled = false; job = InstallJob(label, "Connecting to iOS")
+        active = true; cancelled = false; job = CydiaTransferJob(label, "Connecting to iOS")
         try { DownloadService.hold(app, "Sending .deb to iOS") } catch (failure: Exception) {
             DownloadService.release(app)
-            active = false; job = InstallJob(label, "", error = failure.message ?: "Could not start the transfer.")
+            active = false; job = CydiaTransferJob(label, "", error = failure.message ?: "Could not start the transfer.")
             return
         }
         Thread({
             val directory = File(app.cacheDir, "cydia-transfers/${UUID.randomUUID()}")
             val file = File(directory, "package.deb")
-            val report: (InstallJob) -> Unit = { next -> handler.post { job = next } }
-            var outcome: InstallJob
+            val report: (CydiaTransferJob) -> Unit = { next -> handler.post { job = next } }
+            var outcome: CydiaTransferJob
             try {
                 val apps = GuestApps(app)
                 apps.run(socket, listOf("deb-probe"), 60)
@@ -200,7 +204,7 @@ internal object CydiaTransfers {
                 check(directory.mkdirs()) { "Cannot create the temporary package folder." }
                 val name = source(app, file, report)
                 if (cancelled) throw CancellationException("Cancelled")
-                report(InstallJob(name, "Checking .deb"))
+                report(CydiaTransferJob(name, "Checking .deb"))
                 val metadata = DebArchive.metadata(file)
                 if (expected != null) check(metadata.id == expected.id && metadata.version == expected.version) { "The downloaded .deb does not match the selected package." }
                 val plan = planned ?: AptDependencies.resolve(metadata, CydiaSources.packages.toList(), present, target.ios)
@@ -217,18 +221,18 @@ internal object CydiaTransfers {
                     } finally { dependencyFile.delete() }
                 }
                 if (cancelled) throw CancellationException("Cancelled")
-                report(InstallJob(name, "Sending to iOS", 0f))
+                report(CydiaTransferJob(name, "Sending to iOS", 0f))
                 val result = apps.uploadDeb(socket, file, name) { event ->
-                    if (event.optString("phase") == "upload") report(InstallJob(name, "Sending to iOS", event.optInt("percent") / 100f))
+                    if (event.optString("phase") == "upload") report(CydiaTransferJob(name, "Sending to iOS", event.optInt("percent") / 100f))
                 }
                 check(result.optBoolean("uploaded") && result.getLong("bytes") == file.length()) { "The iOS transfer could not be confirmed." }
                 val log = installSaved(apps, socket, result.getString("path").substringAfterLast('/'), metadata.name, report)
                 check(installedPackages(apps, socket).any { it.id == metadata.id && it.version == metadata.version }) { "dpkg finished, but the package is absent from Installed. Installation is unconfirmed." }
-                outcome = InstallJob(metadata.name, "Installed ${metadata.version} in iOS" + if (log.contains("Icon cache refresh failed")) ". Restart iOS to refresh icons." else "", 1f, done = true)
+                outcome = CydiaTransferJob(metadata.name, "Installed ${metadata.version} in iOS" + if (log.contains("Icon cache refresh failed")) ". Restart iOS to refresh icons." else "", 1f, done = true)
             } catch (_: CancellationException) {
-                outcome = InstallJob(label, "Cancelled", done = true)
+                outcome = CydiaTransferJob(label, "Cancelled", done = true)
             } catch (failure: Exception) {
-                outcome = InstallJob(label, "", error = failure.message ?: "Could not send the package to iOS.")
+                outcome = CydiaTransferJob(label, "", error = failure.message ?: "Could not send the package to iOS.")
             } finally {
                 file.delete(); directory.delete()
                 DownloadService.release(app)

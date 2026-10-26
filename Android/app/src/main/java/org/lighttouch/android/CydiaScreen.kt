@@ -237,7 +237,7 @@ internal fun CydiaScreen(device: DeviceSummary?, socket: String?, blocked: Boole
         Text(text, Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
-@Composable private fun TransferPanel(job: InstallJob) {
+@Composable private fun TransferPanel(job: CydiaTransferJob) {
     var expanded by remember(job.error) { mutableStateOf(false) }
     Surface(Modifier.fillMaxWidth(), color = if (job.error != null) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer) {
         Column(Modifier.padding(14.dp)) {

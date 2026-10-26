@@ -25,8 +25,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
-enum class Screen { LOADING, SETUP, HOME, FULLSCREEN, SETTINGS, STORE, CYDIA, HITCH }
-enum class Screen { LOADING, SETUP, HOME, FULLSCREEN, SETTINGS, STORE, HITCH, DETAILS }
+enum class Screen { LOADING, SETUP, HOME, FULLSCREEN, SETTINGS, STORE, CYDIA, HITCH, DETAILS }
 
 /** What the screens read from and ask of the activity, which owns the worker and its lifecycle. */
 interface GuestHost {
