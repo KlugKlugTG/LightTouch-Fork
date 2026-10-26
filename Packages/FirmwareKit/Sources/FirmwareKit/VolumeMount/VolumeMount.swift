@@ -192,11 +192,12 @@ public enum VolumeMount {
 
     /// `fsck_hfs -fn` (check only; -f because the data volume is journaled) of an attached, unmounted device.
     public static func check(_ dev: String) async throws -> (ok: Bool, output: String) {
-        #if !os(macOS)
-        throw macOnly("Checking a volume with fsck_hfs")
+        #if os(macOS)
+            let (status, out) = try await exec("/sbin/fsck_hfs", ["-fn", dev])
+            return (status == 0 && out.contains("appears to be OK"), out)
+        #else
+            throw macOnly("Checking a volume with fsck_hfs")
         #endif
-        let (status, out) = try await exec("/sbin/fsck_hfs", ["-fn", dev])
-        return (status == 0 && out.contains("appears to be OK"), out)
     }
 
     /// smoke #36: macOS 27's HFS driver now and then writes a directory's HFSX folder count as 0 at the unmount
@@ -248,19 +249,21 @@ public enum VolumeMount {
     /// (rounded down to 4 KiB): newfs_hfs writes only metadata, so a 14.7 GB data volume costs ~40 MB.
     public static func makeHFS(_ image: URL, size: Int64, name: String = "Data", journaled: Bool = true) async throws {
         #if !os(macOS)
-        return try HFSPlusEditor.format(image, size: size, name: name, journaled: journaled)
+            return try HFSPlusEditor.format(image, size: size, name: name, journaled: journaled)
+        #else
+            guard FileManager.default.createFile(atPath: image.path, contents: nil),
+                truncate(image.path, off_t(size / 4096 * 4096)) == 0
+            else {
+                throw FirmwareError(.internal, "cannot create \(image.path)")
+            }
+            let dev = try await attach(image)
+            do { try await run("/sbin/newfs_hfs", ["-s"] + (journaled ? ["-J"] : []) + ["-v", name, dev]) }
+            catch {
+                await cleanupDetach(dev)
+                throw error
+            }
+            try await detach(dev)
         #endif
-        guard FileManager.default.createFile(atPath: image.path, contents: nil),
-            truncate(image.path, off_t(size / 4096 * 4096)) == 0
-        else {
-            throw FirmwareError(.internal, "cannot create \(image.path)")
-        }
-        let dev = try await attach(image)
-        do { try await run("/sbin/newfs_hfs", ["-s"] + (journaled ? ["-J"] : []) + ["-v", name, dev]) } catch {
-            await cleanupDetach(dev)
-            throw error
-        }
-        try await detach(dev)
     }
 
     /// Grows the volume in `image` to `bytes` (a multiple of 4096). The resize grows the file and the file
@@ -272,18 +275,19 @@ public enum VolumeMount {
     {
         guard try size(image) != bytes else { return }
         #if !os(macOS)
-        return try HFSPlusEditor.grow(image, toBytes: bytes)
+            try HFSPlusEditor.grow(image, toBytes: bytes)
+        #else
+            try await DiskImage.resize(image, toBytes: bytes, backend: backend)
+            let old = try size(image)
+            guard old <= bytes else { throw FirmwareError(.internal, "resize overshot \(bytes) bytes (\(old))") }
+            let f = try FileHandle(forUpdating: image)
+            defer { try? f.close() }
+            try f.seek(toOffset: UInt64(old - 1024))
+            let avh = try f.read(upToCount: 512) ?? Data()
+            try f.truncate(atOffset: UInt64(bytes))
+            try f.seek(toOffset: UInt64(bytes - 1024))
+            try f.write(contentsOf: avh)
         #endif
-        try await DiskImage.resize(image, toBytes: bytes, backend: backend)
-        let old = try size(image)
-        guard old <= bytes else { throw FirmwareError(.internal, "resize overshot \(bytes) bytes (\(old))") }
-        let f = try FileHandle(forUpdating: image)
-        defer { try? f.close() }
-        try f.seek(toOffset: UInt64(old - 1024))
-        let avh = try f.read(upToCount: 512) ?? Data()
-        try f.truncate(atOffset: UInt64(bytes))
-        try f.seek(toOffset: UInt64(bytes - 1024))
-        try f.write(contentsOf: avh)
     }
 
     static func size(_ u: URL) throws -> Int {

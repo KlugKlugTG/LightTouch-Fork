@@ -30,6 +30,10 @@
 // _securityd's in the archive) stays out: iOS's trust store is the firmware's own and the web proxy's trust only
 // (WebProxySetup). Extracted, it was root's and securityd couldn't open it, so every trust edit failed (-50).
 //
+// The archives are extracted with the host's tar: BSD tar on the Mac, GNU tar on Linux, toybox on Android (which
+// reports every file -k keeps as "File exists" and exits 1 for it). Each one's listing is read for the files whose
+// set-user-ID or set-group-ID bit tar, not run as root, drops; the catalog puts those modes back.
+//
 //   let file = try SystemEdits.Cydia.bootstrap(in: caches.appendingPathComponent("Jailbreak"), log: log)
 //   let (line, root, mobile) = try SystemEdits.installCydia(m, bootstrap: file)
 
@@ -111,7 +115,8 @@ extension SystemEdits {
     ) {
         let afc2 = try installAFC2(m)
         let cydia = try installCydia(m, bootstrap: bootstrap)
-        var root = afc2.root + cydia.root
+        let installer = try installDebInstaller(m)
+        var root = afc2.root + cydia.root + installer.root
         let typein = "usr/lib/it_typein.dylib"
         if typeinBySubstrate, FileManager.default.fileExists(atPath: m.appendingPathComponent(typein).path) {
             try editSpringBoardJob(m) { env, _ in
@@ -133,7 +138,16 @@ extension SystemEdits {
             )
             root += ["Library/MobileSubstrate", dir, dir + "/it_typein.dylib", dir + "/it_typein.plist"]
         }
-        return (afc2.line, cydia.line, root, cydia.mobile, cydia.modes)
+        return (afc2.line, cydia.line, root, cydia.mobile, cydia.modes + installer.modes)
+    }
+
+    /// App-owned Android storage may reject hard links; materialize their contents as separate files there.
+    static var copyBootstrapHardLinks: Bool {
+        #if os(Android)
+        true
+        #else
+        false
+        #endif
     }
 
     /// The bootstrap extracted into the mounted system volume `m`, keeping every file the firmware already has (tar
@@ -141,7 +155,7 @@ extension SystemEdits {
     /// /private/var/mobile, root's elsewhere (its symbolic links too, which tar replaces). `modes`: the set-user-ID
     /// and set-group-ID files it added (cydo, su, login, passwd) with their archive modes, which tar, not run as root,
     /// doesn't restore; the catalog takes them with the root owner (HFSPlusVolume.setOwner).
-    static func installCydia(_ m: URL, bootstrap: URL) throws -> (
+    static func installCydia(_ m: URL, bootstrap: URL, copyHardLinks: Bool = copyBootstrapHardLinks) throws -> (
         line: String, root: [String], mobile: [String], modes: [(path: String, mode: UInt16)]
     ) {
         let fm = FileManager.default
@@ -164,18 +178,37 @@ extension SystemEdits {
         ].filter(\.1).map { bootstrap.deletingLastPathComponent().appendingPathComponent($0.0) }
         var entries: [String] = []
         var special: [(path: String, mode: UInt16)] = []
+        var archiveLinks: [[(path: String, target: String)]] = []
         for p in packages {
             entries += try tar(["-tf", p.path]).split(separator: "\n").map(Self.entryPath).filter {
                 $0 != Cydia.excluded && !$0.hasPrefix(Cydia.excluded + "/")
             }
-            for line in try tar(["-tvf", p.path]).split(separator: "\n") {
+            let verbose = try tar(["-tvf", p.path]).split(separator: "\n")
+            archiveLinks.append(copyHardLinks ? verbose.compactMap { Self.bootstrapHardLink(String($0)) } : [])
+            for line in verbose {
                 if let entry = Self.specialMode(String(line)) { special.append(entry) }
             }
         }
         entries = entries.filter { !$0.isEmpty }
         let added = Set(entries.filter { !exists($0) })
-        for p in packages {
-            _ = try tar(["-xkf", p.path, "-C", m.path, "--exclude", "./" + Cydia.excluded, "--exclude", Cydia.excluded])
+        for (p, hardLinks) in zip(packages, archiveLinks) {
+            // -k keeps every file the firmware has. toybox (Android) reports each one it skips as "File exists" and
+            // exits 1 for it. GNU also reports skipped files and a summary; tolerate only those diagnostics.
+            _ = try tar(
+                ["-xkf", p.path, "-C", m.path, "--exclude", "./" + Cydia.excluded, "--exclude", Cydia.excluded]
+                    + hardLinks.flatMap { ["--exclude", "./" + $0.path, "--exclude", $0.path] },
+                tolerating: ["File exists"]
+            )
+            // Android app SELinux policy can reject link(2), even between files owned by this UID. Preserve
+            // the archive's contents and modes with independent copies, without changing that policy.
+            for hardLink in hardLinks where !exists(hardLink.path) {
+                guard exists(hardLink.target) else {
+                    throw FirmwareError(.internal, "Cydia: hard-link source \(hardLink.target) is missing")
+                }
+                let destination = m.appendingPathComponent(hardLink.path)
+                try mkdirs(destination.deletingLastPathComponent())
+                try copyTree(m.appendingPathComponent(hardLink.target), destination)
+            }
         }
         guard exists("Applications/Cydia.app/Cydia") else {
             throw FirmwareError(.internal, "Cydia bootstrap: no Applications/Cydia.app/Cydia after extracting")
@@ -228,16 +261,23 @@ extension SystemEdits {
         )
     }
 
-    /// A tar listing's member name as a volume path: no leading ./, no trailing /.
+    /// A bootstrap tar listing's member name as a volume path: toybox also prints link destinations in -t output.
     static func entryPath(_ name: Substring) -> String {
-        String(name.hasPrefix("./") ? name.dropFirst(2) : name).trimmingCharacters(in: ["/"])
+        let listing = String(name)
+        let suffix = [" -> ", " link to "].compactMap { listing.range(of: $0)?.lowerBound }.min()
+        let member = suffix.map { String(listing[..<$0]) } ?? listing
+        return String(member.hasPrefix("./") ? member.dropFirst(2) : member[...]).trimmingCharacters(in: ["/"])
     }
 
     /// A `tar -tv` line of a regular file with the set-user-ID or set-group-ID bit: its path and full permission
-    /// bits ("-rwsr-sr-x  0 root wheel 133808 Feb 15  2017 ./usr/libexec/cydia/cydo" is 0o6755).
+    /// bits. Every tar prints the mode first and the name last, but the fields between them differ: BSD tar (macOS)
+    /// writes the link count, owner, group, size and "Mon DD YYYY" ("-rwsr-sr-x  0 root wheel 133808 Feb 15  2017
+    /// ./usr/libexec/cydia/cydo"), GNU tar (Linux) and toybox (Android) the owner/group, size and "YYYY-MM-DD HH:MM"
+    /// ("-rwsr-sr-x root/wheel 133808 2017-02-16 02:44 ./usr/libexec/cydia/cydo"). Both are 0o6755. The name is
+    /// whatever follows the date, spaces and all.
     static func specialMode(_ line: String) -> (path: String, mode: UInt16)? {
-        let fields = line.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: true)
-        guard fields.count == 9, fields[0].count == 10, fields[0].first == "-" else { return nil }
+        let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count >= 6, fields[0].count == 10, fields[0].first == "-" else { return nil }
         let p = Array(fields[0].dropFirst())
         var mode: UInt16 = 0
         for (i, c) in p.enumerated() where c != "-" && c != "S" && c != "T" {
@@ -246,25 +286,113 @@ extension SystemEdits {
         if p[2] == "s" || p[2] == "S" { mode |= 0o4000 }
         if p[5] == "s" || p[5] == "S" { mode |= 0o2000 }
         guard mode & 0o6000 != 0 else { return nil }
-        return (entryPath(fields[8]), mode)
+        guard let member = tarVerboseMember(line) else { return nil }
+        return (entryPath(member[...]), mode)
     }
 
-    /// /usr/bin/tar `args`; its stdout, or an error with its stderr.
-    private static func tar(_ args: [String]) throws -> String {
+    static func bootstrapHardLink(_ line: String) -> (path: String, target: String)? {
+        guard let first = line.first, first == "-" || first == "h",
+            let member = tarVerboseMember(line), let marker = member.range(of: " link to ")
+        else { return nil }
+        let path = String(member[..<marker.lowerBound])
+        let target = String(member[marker.upperBound...])
+        func safe(_ raw: String) -> String? {
+            guard !raw.hasPrefix("/") else { return nil }
+            let name = raw.hasPrefix("./") ? String(raw.dropFirst(2)) : raw
+            guard !name.isEmpty, !name.split(separator: "/", omittingEmptySubsequences: false).contains(where: {
+                $0.isEmpty || $0 == "." || $0 == ".."
+            }) else { return nil }
+            return name
+        }
+        guard let path = safe(path), let target = safe(target) else { return nil }
+        return (path, target)
+    }
+
+    private static func tarVerboseMember(_ line: String) -> String? {
+        let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count >= 6, fields[0].count == 10 else { return nil }
+        // The date, then the name: "2017-02-16 02:44" (GNU tar, toybox) or "Feb 15  2017" (BSD tar, which writes
+        // the time of day for a file younger than six months).
+        let name: Int
+        if let day = fields.firstIndex(where: { Self.isCalendarDay($0) }), fields.count > day + 2 {
+            name = day + 2
+        } else if let month = fields.firstIndex(where: { Self.isMonth($0) }), fields.count > month + 3,
+            fields[month + 1].allSatisfy({ $0.isNumber })
+        {
+            name = month + 3
+        } else {
+            return nil
+        }
+        return fields[name...].joined(separator: " ")
+    }
+
+    /// "2017-02-16": the day GNU tar and toybox print before the time.
+    private static func isCalendarDay(_ field: Substring) -> Bool {
+        let c = Array(field)
+        return c.count == 10 && c[4] == "-" && c[7] == "-"
+            && (0..<10).allSatisfy { $0 == 4 || $0 == 7 || c[$0].isNumber }
+    }
+
+    /// "Feb": the month BSD tar prints before the day.
+    private static func isMonth(_ field: Substring) -> Bool {
+        [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ].contains(String(field))
+    }
+
+    /// The host's tar: /usr/bin/tar on the Mac (BSD) and Linux (GNU), /system/bin/tar on Android (toybox, which also
+    /// brings the gzip a freeze.tar.gz needs; all three read a gzipped archive by its signature and take -k, -C and
+    /// --exclude). `LT_TAR` names another.
+    static let tarExecutable = [
+        ProcessInfo.processInfo.environment["LT_TAR"], "/usr/bin/tar", "/bin/tar", "/usr/local/bin/tar",
+        "/system/bin/tar", "C:\\Windows\\System32\\tar.exe",
+    ].compactMap { $0 }.first { FileManager.default.isExecutableFile(atPath: $0) }
+
+    /// `tar` `args`; its stdout, or an error with its stderr. A non-zero exit is an error unless every line of its
+    /// stderr holds one of `tolerating` (toybox's report of the files -k kept).
+    private static func tar(_ args: [String], tolerating: [String] = []) throws -> String {
+        guard let executable = tarExecutable else {
+            throw FirmwareError(.internal, "Cydia: no tar (looked for /usr/bin/tar, /system/bin/tar; set LT_TAR)")
+        }
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        p.executableURL = URL(fileURLWithPath: executable)
         p.arguments = args
+        p.environment = ProcessInfo.processInfo.environment.merging(["LC_ALL": "C"]) { _, value in value }
         let out = Pipe()
-        let err = Pipe()
+        // -k can report thousands of existing files. A second unread pipe would fill and block tar while
+        // we wait for stdout to close. Keep stderr in a temporary file until the child has exited.
+        let errorFile = FileManager.default.temporaryDirectory.appendingPathComponent("firmwarekit-tar-\(UUID()).log")
+        guard FileManager.default.createFile(atPath: errorFile.path, contents: nil) else {
+            throw FirmwareError(.internal, "Cydia: cannot create tar's diagnostic file")
+        }
+        defer { try? FileManager.default.removeItem(at: errorFile) }
+        let err = try FileHandle(forWritingTo: errorFile)
+        defer { try? err.close() }
         p.standardOutput = out
         p.standardError = err
-        try p.run()
+        do { try p.run() } catch {
+            throw FirmwareError(.internal, "Cydia: cannot start \(executable): \(error.localizedDescription)")
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        let errors = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            throw FirmwareError(.internal, "tar \(args.first ?? ""): \(String(decoding: errors, as: UTF8.self))")
+        let errors = try Data(contentsOf: errorFile)
+        let reported = String(decoding: errors, as: UTF8.self)
+        let tolerated = tarReportsOnlySkippedFiles(reported, tolerating: tolerating)
+        guard p.terminationStatus == 0 || tolerated else {
+            throw FirmwareError(.internal, "tar \(args.first ?? ""): \(reported)")
         }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    static func tarReportsOnlySkippedFiles(_ reported: String, tolerating: [String]) -> Bool {
+        let lines = reported.split(separator: "\n").filter {
+            !$0.trimmingCharacters(in: .whitespaces).isEmpty
+                && !$0.hasSuffix(": Exiting with failure status due to previous errors")
+                && !$0.hasSuffix(": had errors")
+        }
+        // GNU tar and some toybox versions add a generic failure summary after their -k reports.
+        // A generic summary alone or any other diagnostic still fails the extraction.
+        return !tolerating.isEmpty && !lines.isEmpty
+            && lines.allSatisfy { line in tolerating.contains { line.contains($0) } }
     }
 }

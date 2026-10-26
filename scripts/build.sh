@@ -215,9 +215,13 @@ build_firmwarekit() {
 build_firmwarekit_android() {
     log "firmwarekit (android arm64)"
     . "$LT_SWIFT_ENV"
-    (cd "$REPO/Packages/FirmwareKit" && swift build -c release --product firmwarekit --swift-sdk "$LT_SWIFT_ANDROID_SDK" \
+    local sdk_path=()
+    [ -z "${LT_SWIFT_SDKS_PATH:-}" ] || sdk_path=(--swift-sdks-path "$LT_SWIFT_SDKS_PATH")
+    export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+    export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+    (cd "$REPO/Packages/FirmwareKit" && swift build -c release --product firmwarekit --swift-sdk "$LT_SWIFT_ANDROID_SDK" "${sdk_path[@]}" --jobs "$JOBS" \
         --scratch-path .build-android --static-swift-stdlib --pkg-config-path build-support/android-pkgconfig \
-        -Xlinker -lssl -Xlinker -lcrypto 2>&1 | tail -3)
+        -Xlinker -lssl -Xlinker -lcrypto -Xlinker -z -Xlinker max-page-size=16384 2>&1 | tail -3)
     mkdir -p "$OUT/firmwarekit/android"
     cp "$REPO/Packages/FirmwareKit/.build-android/out/Products/Release-android-aarch64/firmwarekit" "$OUT/firmwarekit/android/"
     "$NDK_BIN/llvm-strip" "$OUT/firmwarekit/android/firmwarekit"

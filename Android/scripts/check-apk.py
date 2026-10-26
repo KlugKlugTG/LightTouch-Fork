@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check all APK native entries: no compression and ELF PT_LOAD 16KiB alignment."""
+"""Check all APK native entries: packaging, ELF PT_LOAD 16KiB alignment and packaged ANGLE identities."""
 import argparse
 import hashlib
 import json
@@ -74,20 +74,29 @@ def check_angle_runtime(archive):
     return set(present)
 
 
-def check_apk(path):
+def check_apk(path, legacy_packaging=False):
     count = 0
+    compressed = []
     with zipfile.ZipFile(path) as archive:
         with open(path, "rb") as apk:
             for entry in archive.infolist():
                 if not entry.filename.startswith("lib/") or not entry.filename.endswith(".so"):
                     continue
                 count += 1
-                assert entry.compress_type == zipfile.ZIP_STORED, f"Compressed {entry.filename}"
-                apk.seek(entry.header_offset)
-                local = apk.read(30)
-                name_length, extra_length = struct.unpack_from("<HH", local, 26)
-                offset = entry.header_offset + 30 + name_length + extra_length
-                assert offset % 16384 == 0, f"Unaligned APK entry {entry.filename}: {offset}"
+                if entry.compress_type == zipfile.ZIP_STORED:
+                    # Stored entries are mapped straight out of the APK, so the entry
+                    # itself must start on a 16KiB boundary.
+                    apk.seek(entry.header_offset)
+                    local = apk.read(30)
+                    name_length, extra_length = struct.unpack_from("<HH", local, 26)
+                    offset = entry.header_offset + 30 + name_length + extra_length
+                    assert offset % 16384 == 0, f"Unaligned APK entry {entry.filename}: {offset}"
+                else:
+                    # useLegacyPackaging: the installer extracts these to
+                    # nativeLibraryDir, so entry offsets and alignment inside the
+                    # archive carry no meaning. The ELF contract below still does.
+                    assert legacy_packaging, f"Compressed {entry.filename}"
+                    compressed.append(entry.filename)
                 data = archive.read(entry)
                 assert data[:6] == b"\x7fELF\x02\x01", f"Expected little-endian ELF64: {entry.filename}"
                 phoff = struct.unpack_from("<Q", data, 32)[0]
@@ -100,14 +109,24 @@ def check_apk(path):
                         alignment = struct.unpack_from("<Q", data, position + 48)[0]
                         assert alignment >= 16384, f"4KiB ELF LOAD in {entry.filename}: {alignment}"
                         assert (virtual - file_offset) % 16384 == 0, f"Unaligned ELF LOAD: {entry.filename}"
-                print(entry.filename, "uncompressed, APK/ELF aligned 16KiB")
+                packaging = "compressed, legacy" if entry.compress_type != zipfile.ZIP_STORED else "uncompressed, APK/ELF"
+                print(entry.filename, f"{packaging} aligned 16KiB")
         check_angle_runtime(archive)
     assert count, "APK has no native libraries"
     print(f"Checked {count} shared libraries; runtime/device acceptance still required")
+    if compressed:
+        assert legacy_packaging, "Compressed native libraries without legacy packaging"
+        print(f"{len(compressed)} of {count} are compressed and extracted on install (useLegacyPackaging)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("apk")
+    parser.add_argument(
+        "--legacy-packaging",
+        action="store_true",
+        help="the APK extracts its libraries on install (useLegacyPackaging), so compressed entries are expected "
+        "and the archive-offset alignment assertions of stored entries do not apply",
+    )
     args = parser.parse_args()
-    check_apk(args.apk)
+    check_apk(args.apk, legacy_packaging=args.legacy_packaging)

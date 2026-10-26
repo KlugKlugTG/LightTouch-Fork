@@ -9,6 +9,11 @@
  *   liblt_appservice.so info    --socket <mux.sock>
  *   liblt_appservice.so install --socket <mux.sock> --ipa <path> --bundle-id <id>
  *   liblt_appservice.so list    --socket <mux.sock>
+ *   liblt_appservice.so deb-list --socket <mux.sock>
+ *   liblt_appservice.so upload-deb --socket <mux.sock> --deb <path> --deb-name <name.deb>
+ *   liblt_appservice.so deb-probe|deb-installed --socket <mux.sock>
+ *   liblt_appservice.so deb-queue --socket <mux.sock> --deb-name <name.deb> --token <32 hex>
+ *   liblt_appservice.so deb-status --socket <mux.sock> --token <32 hex>
  *   liblt_appservice.so syslog  --socket <mux.sock> --seconds <1..600>
  *
  * Output is JSON Lines on stdout (one object per line, flushed):
@@ -64,6 +69,8 @@
 #define UNPACK_FLOOR_BPS (256u << 10)
 #define SPACE_POLL_MS 2000
 #define STAGING_DIR "PublicStaging"
+#define DEB_DIR "Un1box/Packages"
+#define DEB_LIMIT (512ull << 20)
 
 /* ---------- JSON output ---------- */
 
@@ -479,26 +486,21 @@ static int browse_user_apps(struct session *s, plist_t *apps)
 
 /* ---------- list ---------- */
 
-/* Newest crash report (by name, which embeds the date), for diagnosing an app that quits on
- * launch. iOS keeps them in the crash-report copy service's AFC root; LatestCrash links skipped. */
-static int action_crashlog(struct session *s)
+static const char *crash_report_date(const char *name)
 {
-	lockdownd_service_descriptor_t service = start_service(s, "com.apple.crashreportcopymobile");
-	if (!service)
-		return 1;
-	afc_client_t afc = NULL;
-	afc_error_t err = afc_client_new(s->device, service, &afc);
-	lockdownd_service_descriptor_free(service);
-	if (err != AFC_E_SUCCESS) {
-		emit_error("connect crash reports failed (device error %d).", (int)err);
-		return 1;
+	for (const char *p = name; *p; p++) {
+		if ((*p == '_' || *p == '-') && p[1] == '2' && p[2] == '0') return p + 1;
 	}
+	return NULL;
+}
+
+/* 0: report returned, 1: empty, -1: read failed. Root jailbreak apps store reports outside
+ * crashreportcopymobile's directory; read those through the existing AFC2 service as a fallback. */
+static int crashlog_from_afc(afc_client_t afc, const char *directory)
+{
 	char **list = NULL;
-	int rc = 1;
-	if (afc_read_directory(afc, "/", &list) != AFC_E_SUCCESS || !list) {
-		emit_error("list crash reports failed.");
-		goto done;
-	}
+	int rc = -1;
+	if (afc_read_directory(afc, directory, &list) != AFC_E_SUCCESS || !list) goto done;
 	const char *newest = NULL;
 	for (int i = 0; list[i]; i++) {
 		const char *n = list[i];
@@ -507,20 +509,17 @@ static int action_crashlog(struct session *s)
 		             (len > 6 && strcmp(n + len - 6, ".crash") == 0);
 		if (n[0] == '.' || strncmp(n, "LatestCrash", 11) == 0 || !report)
 			continue;
-		/* Names end in _YYYY-MM-DD-HHMMSS_device.ext: compare from the first '_2'. */
-		const char *d = strstr(n, "_20"), *nd = newest ? strstr(newest, "_20") : NULL;
+		const char *d = crash_report_date(n), *nd = newest ? crash_report_date(newest) : NULL;
 		if (!newest || (d && (!nd || strcmp(d, nd) > 0)))
 			newest = n;
 	}
 	struct buf b = {0};
 	if (!newest) {
-		buf_puts(&b, "{\"result\":{\"name\":null}}");
-		emit(&b);
-		rc = 0;
+		rc = 1;
 		goto done;
 	}
 	char path[1024];
-	snprintf(path, sizeof path, "/%s", newest);
+	snprintf(path, sizeof path, "%s/%s", directory, newest);
 	uint64_t handle = 0;
 	if (afc_file_open(afc, path, AFC_FOPEN_RDONLY, &handle) != AFC_E_SUCCESS) {
 		emit_error("open crash report failed.");
@@ -544,8 +543,33 @@ static int action_crashlog(struct session *s)
 done:
 	if (list)
 		afc_dictionary_free(list);
-	afc_client_free(afc);
 	return rc;
+}
+
+static int action_crashlog(struct session *s)
+{
+	lockdownd_service_descriptor_t service = start_service(s, "com.apple.crashreportcopymobile");
+	if (!service) return 1;
+	afc_client_t afc = NULL;
+	afc_error_t err = afc_client_new(s->device, service, &afc);
+	lockdownd_service_descriptor_free(service);
+	if (err != AFC_E_SUCCESS) { emit_error("connect crash reports failed (device error %d).", (int)err); return 1; }
+	int rc = crashlog_from_afc(afc, "/");
+	afc_client_free(afc);
+	if (rc < 0) { emit_error("read crash reports failed."); return 1; }
+	if (!rc) return 0;
+	service = NULL;
+	if (lockdownd_start_service(s->lockdown, "com.apple.afc2", &service) == LOCKDOWN_E_SUCCESS && service) {
+		afc = NULL;
+		if (afc_client_new(s->device, service, &afc) == AFC_E_SUCCESS) {
+			rc = crashlog_from_afc(afc, "/Library/Logs/CrashReporter");
+			afc_client_free(afc);
+		}
+	}
+	if (service) lockdownd_service_descriptor_free(service);
+	if (!rc) return 0;
+	struct buf b = {0}; buf_puts(&b, "{\"result\":{\"name\":null}}"); emit(&b);
+	return 0;
 }
 
 static int action_list(struct session *s)
@@ -1000,6 +1024,357 @@ out:
 	return rc;
 }
 
+/* .deb files are retained in the guest's Media folder; the root worker runs dpkg. */
+static int deb_name_valid(const char *name)
+{
+	size_t n = name ? strlen(name) : 0;
+	if (n < 5 || n > 128 || name[0] == '.' || strcmp(name + n - 4, ".deb"))
+		return 0;
+	for (size_t i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)name[i];
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'))
+			return 0;
+	}
+	return 1;
+}
+
+static afc_client_t deb_afc_open(struct session *s)
+{
+	lockdownd_service_descriptor_t service = start_service(s, AFC_SERVICE_NAME);
+	if (!service)
+		return NULL;
+	afc_client_t afc = NULL;
+	afc_error_t err = afc_client_new(s->device, service, &afc);
+	lockdownd_service_descriptor_free(service);
+	if (afc_check(err, "connect iOS file service"))
+		return NULL;
+	return afc;
+}
+
+static int deb_file_size(afc_client_t afc, const char *path, uint64_t *size)
+{
+	char **info = NULL;
+	if (afc_check(afc_get_file_info(afc, path, &info), "check uploaded package"))
+		return -1;
+	int valid = 0, regular = 0;
+	for (size_t i = 0; info && info[i] && info[i + 1]; i += 2) {
+		if (!strcmp(info[i], "st_ifmt"))
+			regular = !strcmp(info[i + 1], "S_IFREG");
+		if (!strcmp(info[i], "st_size")) {
+			char *end = NULL;
+			errno = 0;
+			unsigned long long value = strtoull(info[i + 1], &end, 10);
+			if (!errno && end != info[i + 1] && !*end && info[i + 1][0] >= '0' && info[i + 1][0] <= '9') {
+				*size = value;
+				valid = 1;
+			}
+		}
+	}
+	if (info)
+		afc_dictionary_free(info);
+	if (!valid || !regular) {
+		emit_error("The guest returned invalid package file metadata.");
+		return -1;
+	}
+	return 0;
+}
+
+static int action_deb_list(struct session *s)
+{
+	afc_client_t afc = deb_afc_open(s);
+	if (!afc)
+		return 1;
+	char **names = NULL;
+	afc_error_t err = afc_read_directory(afc, DEB_DIR, &names);
+	if (err != AFC_E_SUCCESS && err != AFC_E_OBJECT_NOT_FOUND) {
+		afc_check(err, "read iOS package folder");
+		afc_client_free(afc);
+		return 1;
+	}
+	struct buf b = {0};
+	buf_puts(&b, "{\"result\":{\"files\":[");
+	unsigned count = 0;
+	for (size_t i = 0; names && names[i]; i++) {
+		if (!deb_name_valid(names[i]))
+			continue;
+		if (++count > 1000) {
+			emit_error("The iOS package folder contains more than 1000 packages.");
+			goto fail;
+		}
+		char remote[256];
+		snprintf(remote, sizeof(remote), DEB_DIR "/%s", names[i]);
+		uint64_t size = 0;
+		if (deb_file_size(afc, remote, &size))
+			goto fail;
+		if (count > 1)
+			buf_puts(&b, ",");
+		buf_puts(&b, "{\"name\":");
+		json_string(&b, names[i]);
+		buf_puts(&b, ",\"path\":");
+		char path[288];
+		snprintf(path, sizeof(path), "/var/mobile/Media/%s", remote);
+		json_string(&b, path);
+		buf_printf(&b, ",\"bytes\":%" PRIu64 "}", size);
+	}
+	buf_puts(&b, "]}}");
+	emit(&b);
+	if (names)
+		afc_dictionary_free(names);
+	afc_client_free(afc);
+	return 0;
+fail:
+	free(b.data);
+	if (names)
+		afc_dictionary_free(names);
+	afc_client_free(afc);
+	return 1;
+}
+
+static int action_upload_deb(struct session *s, const char *source, const char *name)
+{
+	int fd = open(source, O_RDONLY | O_CLOEXEC);
+	struct stat st;
+	unsigned char magic[8];
+	if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 8 ||
+	    (uint64_t)st.st_size > DEB_LIMIT || pread(fd, magic, sizeof(magic), 0) != sizeof(magic) ||
+	    memcmp(magic, "!<arch>\n", sizeof(magic))) {
+		emit_error("Choose a readable .deb package smaller than 512 MB.");
+		if (fd >= 0)
+			close(fd);
+		return 1;
+	}
+	afc_client_t afc = deb_afc_open(s);
+	if (!afc) {
+		close(fd);
+		return 1;
+	}
+	unsigned char random[16];
+	arc4random_buf(random, sizeof(random));
+	char token[33];
+	for (size_t i = 0; i < sizeof(random); i++)
+		snprintf(token + i * 2, sizeof(token) - i * 2, "%02x", random[i]);
+	char remote[256], partial[256];
+	snprintf(remote, sizeof(remote), DEB_DIR "/%.*s-%s.deb", (int)strlen(name) - 4, name, token);
+	snprintf(partial, sizeof(partial), DEB_DIR "/.%s.upload", token);
+	int rc = 1, opened = 0, staged = 0;
+	uint64_t handle = 0, total = (uint64_t)st.st_size, available = 0;
+	char *buffer = NULL;
+	if (free_bytes(afc, &available) || available < total + (1u << 20)) {
+		emit_error("iOS does not have enough free space for this .deb.");
+		goto out;
+	}
+	const char *directories[] = {"Un1box", DEB_DIR};
+	for (size_t i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+		afc_error_t err = afc_make_directory(afc, directories[i]);
+		if (err != AFC_E_SUCCESS && err != AFC_E_OBJECT_EXISTS) {
+			afc_check(err, "create iOS package folder");
+			goto out;
+		}
+	}
+	if (afc_check(afc_file_open(afc, partial, AFC_FOPEN_WRONLY, &handle), "open package upload"))
+		goto out;
+	opened = 1;
+	staged = 1;
+	buffer = malloc(UPLOAD_CHUNK);
+	if (!buffer) {
+		emit_error("out of memory");
+		goto out;
+	}
+	uint64_t sent = 0;
+	int last_percent = -1;
+	for (;;) {
+		ssize_t got = read(fd, buffer, UPLOAD_CHUNK);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got < 0) {
+			emit_error("Reading the .deb failed: %s", strerror(errno));
+			goto out;
+		}
+		if (!got)
+			break;
+		for (uint32_t offset = 0; offset < (uint32_t)got;) {
+			uint32_t written = 0, remaining = (uint32_t)got - offset;
+			if (afc_check(afc_file_write(afc, handle, buffer + offset, remaining, &written), "send .deb to iOS"))
+				goto out;
+			if (!written || written > remaining) {
+				emit_error("The guest returned an invalid upload length.");
+				goto out;
+			}
+			offset += written;
+			sent += written;
+		}
+		if (sent > total) {
+			emit_error("The .deb changed during transfer.");
+			goto out;
+		}
+		int percent = (int)(sent * 100 / total);
+		if (percent != last_percent) {
+			struct buf b = {0};
+			buf_printf(&b, "{\"phase\":\"upload\",\"percent\":%d}", percent);
+			emit(&b);
+			last_percent = percent;
+		}
+	}
+	if (sent != total) {
+		emit_error("The .deb changed during transfer.");
+		goto out;
+	}
+	if (afc_check(afc_file_close(afc, handle), "finish package upload"))
+		goto out;
+	opened = 0;
+	uint64_t stored = 0;
+	if (deb_file_size(afc, partial, &stored))
+		goto out;
+	if (stored != total) {
+		emit_error("The iOS package copy is incomplete.");
+		goto out;
+	}
+	if (afc_check(afc_rename_path(afc, partial, remote), "save package in iOS"))
+		goto out;
+	struct buf b = {0};
+	buf_puts(&b, "{\"result\":{\"uploaded\":true,\"path\":");
+	char path[288];
+	snprintf(path, sizeof(path), "/var/mobile/Media/%s", remote);
+	json_string(&b, path);
+	buf_printf(&b, ",\"bytes\":%" PRIu64 "}}", total);
+	emit(&b);
+	rc = 0;
+out:
+	if (opened)
+		afc_file_close(afc, handle);
+	if (rc && staged)
+		afc_remove_path(afc, partial);
+	free(buffer);
+	afc_client_free(afc);
+	close(fd);
+	return rc;
+}
+
+#define INSTALL_BASE "/var/root/Media/Un1box"
+static int install_token_valid(const char *token)
+{
+	if (!token || strlen(token) != 32) return 0;
+	for (int i = 0; i < 32; i++)
+		if (!((token[i] >= '0' && token[i] <= '9') || (token[i] >= 'a' && token[i] <= 'f'))) return 0;
+	return 1;
+}
+
+static afc_client_t installer_afc(struct session *s)
+{
+	lockdownd_service_descriptor_t service = start_service(s, "com.apple.afc2");
+	if (!service) {
+		emit_error("iOS did not provide jailbreak file services. Stop iOS, install/update Cydia in device settings, then start it again.");
+		return NULL;
+	}
+	afc_client_t afc = NULL;
+	afc_error_t err = afc_client_new(s->device, service, &afc);
+	lockdownd_service_descriptor_free(service);
+	if (afc_check(err, "connect jailbroken iOS")) return NULL;
+	return afc;
+}
+
+static int installer_ready(afc_client_t afc)
+{
+	const char *paths[] = {"/usr/bin/dpkg", "/usr/libexec/un1box-deb-install", "/System/Library/LaunchDaemons/org.un1box.deb-install.plist"};
+	for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+		char **info = NULL;
+		afc_error_t err = afc_get_file_info(afc, paths[i], &info);
+		if (info) afc_dictionary_free(info);
+		if (err != AFC_E_SUCCESS) {
+			emit_error("The iOS package installer is missing. Stop iOS, apply Jailbreak in device settings to install/update Cydia, then start iOS again.");
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Missing result files are a queued request, not a confirmed installation. */
+static char *installer_read(afc_client_t afc, const char *path, size_t limit, int optional)
+{
+	uint64_t handle = 0;
+	afc_error_t err = afc_file_open(afc, path, AFC_FOPEN_RDONLY, &handle);
+	if (optional && err == AFC_E_OBJECT_NOT_FOUND) return strdup("");
+	if (afc_check(err, "read iOS package state")) return NULL;
+	struct buf b = {0};
+	char chunk[8192];
+	for (;;) {
+		uint32_t got = 0;
+		err = afc_file_read(afc, handle, chunk, sizeof chunk, &got);
+		if (err != AFC_E_SUCCESS || got > sizeof chunk || b.len + got > limit) {
+			afc_file_close(afc, handle); free(b.data);
+			emit_error("Cannot read iOS package state (invalid length or file service error)."); return NULL;
+		}
+		if (!got) break;
+		/* AFC text files are never evaluated as shell input on Android. */
+		for (uint32_t i = 0; i < got; i++) if (!chunk[i]) chunk[i] = ' ';
+		buf_put(&b, chunk, got);
+	}
+	afc_file_close(afc, handle);
+	return b.data ? b.data : strdup("");
+}
+
+static int action_deb_state(struct session *s, const char *action, const char *token)
+{
+	afc_client_t afc = installer_afc(s);
+	if (!afc) return 1;
+	int rc = 1;
+	if (installer_ready(afc)) goto out;
+	struct buf b = {0};
+	if (!strcmp(action, "deb-probe")) {
+		buf_puts(&b, "{\"result\":{\"ready\":true}}"); emit(&b); rc = 0;
+	} else if (!strcmp(action, "deb-installed")) {
+		char *status = installer_read(afc, "/var/lib/dpkg/status", 16u << 20, 0);
+		if (!status) goto out;
+		buf_puts(&b, "{\"result\":{\"status\":"); json_string(&b, status); buf_puts(&b, "}}");
+		free(status); emit(&b); rc = 0;
+	} else {
+		char path[256];
+		snprintf(path, sizeof path, INSTALL_BASE "/Results/%s.status", token);
+		char *status = installer_read(afc, path, 256, 1);
+		if (!status) goto out;
+		snprintf(path, sizeof path, INSTALL_BASE "/Results/%s.log", token);
+		char *log = installer_read(afc, path, 1u << 20, 1);
+		if (!log) { free(status); goto out; }
+		buf_puts(&b, "{\"result\":{\"status\":"); json_string(&b, *status ? status : "queued");
+		buf_puts(&b, ",\"log\":"); json_string(&b, log); buf_puts(&b, "}}");
+		free(status); free(log); emit(&b); rc = 0;
+	}
+out:
+	afc_client_free(afc); return rc;
+}
+
+static int action_deb_queue(struct session *s, const char *name, const char *token)
+{
+	afc_client_t afc = installer_afc(s);
+	if (!afc) return 1;
+	int rc = 1, opened = 0, staged = 0;
+	uint64_t handle = 0, size = 0;
+	char package[288], partial[256], remote[256];
+	snprintf(package, sizeof package, "/var/mobile/Media/" DEB_DIR "/%s", name);
+	snprintf(partial, sizeof partial, INSTALL_BASE "/.%s.request", token);
+	snprintf(remote, sizeof remote, INSTALL_BASE "/InstallQueue/%s.request", token);
+	if (installer_ready(afc) || deb_file_size(afc, package, &size)) goto out;
+	if (size < 8 || size > DEB_LIMIT) { emit_error("Invalid saved .deb size."); goto out; }
+	if (afc_check(afc_file_open(afc, partial, AFC_FOPEN_WRONLY, &handle), "stage install request")) goto out;
+	opened = staged = 1;
+	char request[132]; snprintf(request, sizeof request, "%s\n", name);
+	size_t len = strlen(request);
+	for (size_t at = 0; at < len;) {
+		uint32_t written = 0;
+		if (afc_check(afc_file_write(afc, handle, request + at, (uint32_t)(len - at), &written), "write install request")) goto out;
+		if (!written || written > len - at) { emit_error("Invalid install request write length."); goto out; }
+		at += written;
+	}
+	if (afc_check(afc_file_close(afc, handle), "close install request")) goto out;
+	opened = 0;
+	if (afc_check(afc_rename_path(afc, partial, remote), "queue iOS installation")) goto out;
+	struct buf b = {0}; buf_puts(&b, "{\"result\":{\"queued\":true}}"); emit(&b); rc = 0;
+out:
+	if (opened) afc_file_close(afc, handle);
+	if (rc && staged) afc_remove_path(afc, partial);
+	afc_client_free(afc); return rc;
+}
+
 /* ---------- main ---------- */
 
 /* Same contract as Desktop helper.py: an absolute, non-symlink socket owned by
@@ -1043,7 +1418,7 @@ static void parent_death_guard(void)
 
 static void usage_error(const char *detail)
 {
-	emit_error("%s Usage: info|list|crashlog --socket PATH, install --socket PATH --ipa PATH --bundle-id ID, or syslog --socket PATH --seconds 1..600", detail);
+	emit_error("%s Usage: info|list|crashlog|deb-list|deb-probe|deb-installed --socket PATH; upload-deb --socket PATH --deb PATH --deb-name NAME.deb; deb-queue --socket PATH --deb-name NAME.deb --token HEX32; deb-status --socket PATH --token HEX32; install --socket PATH --ipa PATH --bundle-id ID; syslog --socket PATH --seconds 1..600", detail);
 }
 
 int main(int argc, char **argv)
@@ -1057,6 +1432,7 @@ int main(int argc, char **argv)
 	}
 	const char *action = argv[1];
 	const char *socket_path = NULL, *ipa = NULL, *bundle_id = NULL, *seconds_text = NULL;
+	const char *deb = NULL, *deb_name = NULL, *token = NULL;
 	int verbose = 0;
 	for (int i = 2; i < argc; i++) {
 		const char **slot = NULL;
@@ -1068,6 +1444,12 @@ int main(int argc, char **argv)
 			slot = &bundle_id;
 		else if (strcmp(argv[i], "--seconds") == 0)
 			slot = &seconds_text;
+		else if (strcmp(argv[i], "--deb") == 0)
+			slot = &deb;
+		else if (strcmp(argv[i], "--deb-name") == 0)
+			slot = &deb_name;
+		else if (strcmp(argv[i], "--token") == 0)
+			slot = &token;
 		else if (strcmp(argv[i], "--verbose") == 0) {
 			verbose = 1;
 			continue;
@@ -1083,7 +1465,10 @@ int main(int argc, char **argv)
 	}
 	int is_install = strcmp(action, "install") == 0;
 	int is_syslog = strcmp(action, "syslog") == 0;
-	if (!is_install && !is_syslog && strcmp(action, "info") != 0 && strcmp(action, "list") != 0 && strcmp(action, "crashlog") != 0) {
+	int is_deb = strcmp(action, "upload-deb") == 0;
+	int is_queue = !strcmp(action, "deb-queue"), is_status = !strcmp(action, "deb-status");
+	int is_state = is_status || !strcmp(action, "deb-probe") || !strcmp(action, "deb-installed");
+	if (!is_install && !is_syslog && !is_deb && !is_queue && !is_state && strcmp(action, "deb-list") != 0 && strcmp(action, "info") != 0 && strcmp(action, "list") != 0 && strcmp(action, "crashlog") != 0) {
 		usage_error("Unknown action.");
 		return 1;
 	}
@@ -1102,6 +1487,13 @@ int main(int argc, char **argv)
 	if (!is_install && (ipa || bundle_id)) {
 		usage_error("--ipa/--bundle-id apply to install only.");
 		return 1;
+	}
+	if ((is_deb && (!deb || !*deb || !deb_name_valid(deb_name))) || (is_queue && !deb_name_valid(deb_name)) || (!is_deb && deb) || (!is_deb && !is_queue && deb_name)) {
+		usage_error("upload-deb requires --deb PATH and --deb-name NAME.deb; deb-queue accepts --deb-name NAME.deb. Names must be plain filenames.");
+		return 1;
+	}
+	if (((is_queue || is_status) && !install_token_valid(token)) || (!is_queue && !is_status && token)) {
+		usage_error("deb-queue and deb-status require --token with 32 lowercase hexadecimal characters."); return 1;
 	}
 	unsigned seconds = 0;
 	if (is_syslog) {
@@ -1138,6 +1530,14 @@ int main(int argc, char **argv)
 	if (emit_target(&s) == 0) {
 		if (is_install) {
 			rc = action_install(&s, ipa, bundle_id);
+		} else if (is_deb) {
+			rc = action_upload_deb(&s, deb, deb_name);
+		} else if (is_queue) {
+			rc = action_deb_queue(&s, deb_name, token);
+		} else if (is_state) {
+			rc = action_deb_state(&s, action, token);
+		} else if (strcmp(action, "deb-list") == 0) {
+			rc = action_deb_list(&s);
 		} else if (strcmp(action, "list") == 0) {
 			rc = action_list(&s);
 		} else if (strcmp(action, "crashlog") == 0) {

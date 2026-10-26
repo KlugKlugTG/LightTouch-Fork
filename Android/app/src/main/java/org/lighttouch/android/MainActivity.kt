@@ -79,6 +79,34 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
     private var detailsDevice by mutableStateOf<DeviceSummary?>(null)
     private var muxSocket by mutableStateOf("")
     private var appServicesError by mutableStateOf("")
+    private val store by lazy { StoreModel(applicationContext) { muxSocket.ifEmpty { null } } }
+    private val localIpa = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null && !CydiaTransfers.active) store.installLocal(uri) }
+    private val localDeb = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val worker = engine
+            when {
+                worker == null -> error = "Start iOS before uploading a .deb."
+                storeInstalling || busy || CydiaTransfers.active -> error = "Wait for the current operation to finish, then choose your .deb again."
+                else -> {
+                    try {
+                        // Polling clears the UI's socket while the picker backgrounds iOS. Resume from the
+                        // worker's current state, then obtain its socket before starting the explicit import.
+                        var state = worker.status()
+                        if (state.getString("state") == "paused") {
+                            setPaused(false)
+                            state = worker.status()
+                        }
+                        val socket = state.getString("usbMuxSocket").orEmpty()
+                        if (state.getString("state") != "running" || socket.isEmpty()) {
+                            error = "Start iOS before uploading a .deb."
+                        } else {
+                            CydiaTransfers.import(applicationContext, socket, uri)
+                        }
+                    } catch (_: RemoteException) { error = "Guest worker unavailable" }
+                }
+            }
+        }
+    }
     private val installer by lazy { StoreInstaller.of(applicationContext) }
     private val store by lazy { StoreModel(applicationContext, { muxSocket.ifEmpty { null } }, ::askNotifications) }
     // Android 13+ shows an install queue's progress and result in notifications only once allowed.
@@ -102,12 +130,12 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
     override val settings by lazy { AppSettings(this) }
     private val monitor = PerformanceMonitor { engine }
     override val perf: PerfSnapshot get() = monitor.snapshot
-    override val storeInstalling get() = store.installing
+    override val storeInstalling get() = store.installing || CydiaTransfers.active
     // Save & Stop needs the engine to serialize live GL state on EGL hosts (docs/TODO.md).
     override val canSaveState = false
     /** HOME or FULLSCREEN: what is under any full-page overlay. */
     private var base by mutableStateOf(Screen.HOME)
-    /** LOADING, SETUP, SETTINGS, STORE or HITCH drawn over [base]; null shows the guest. */
+    /** A full-page overlay drawn over [base]; null shows the guest. */
     private var overlay by mutableStateOf<Screen?>(Screen.LOADING)
     private val setup = SetupState()
     private var hitchData by mutableStateOf<HitchData?>(null)
@@ -122,6 +150,11 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
     private val idleHook: () -> Unit = ::installsFinished
     private var firmware: IFirmware? = null
     private var firmwareBound = false
+    // A jailbreak is its own one-shot firmware worker, so it never disturbs a preparation's state.
+    private var edit: IFirmware? = null
+    private var editBound = false
+    private var jailbreakRunning by mutableStateOf(false)
+    private var jailbreakStep by mutableStateOf("")
     private var firmwareRestarting by mutableStateOf(false)
     private var pendingFirmwareStart = false
     private var firmwareExpectedExit = false
@@ -154,6 +187,98 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
             }
         }
         override fun onServiceDisconnected(name: ComponentName) { firmware = null; if (!firmwareRestarting && !firmwareExpectedExit) prep.preparation = workerExitedRun() }
+    }
+    private val editConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) { edit = IFirmware.Stub.asInterface(binder) }
+        override fun onServiceDisconnected(name: ComponentName) { edit = null }
+    }
+
+    override val jailbreaking: Boolean get() = jailbreakRunning
+    override val jailbreakStage: String get() = jailbreakStep
+
+    /**
+     * Cydia on a device that is already in the library: firmwarekit edit --action jailbreak, the same edits a
+     * jailbroken preparation makes, through a stopped edit, so the device keeps its apps and data. It needs the
+     * device stopped (no guest running) and the bootstrap CydiaBootstrap downloads here.
+     */
+    override fun jailbreakSelected() {
+        // The device must be stopped: a running guest holds its volume, and the edit copies it.
+        if (jailbreakRunning || busy || status in listOf("running", "paused", "starting", "stopping") || preparationActive()) return
+        val device = selected ?: return
+        val folder = File(filesDir, "library/records/${device.id}")
+        if (!folder.isDirectory) { error = "The device's folder is missing; start it once, then try again"; return }
+        // firmwarekit's stopped editor reads its own device store (device.plist beside base and work). This
+        // library keeps devices in the engine's layout (record.json, base, state), so the edit refuses with a
+        // file-not-found from deep inside; say so here instead, before anything runs.
+        if (!File(folder, "device.plist").isFile) {
+            error = "This build can't jailbreak a device it has already prepared: firmwarekit's editor and " +
+                "this app's device storage use different layouts. Turn on Cydia (jailbreak) while preparing " +
+                "a system from an IPSW instead."
+            return
+        }
+        if (!CydiaBootstrap.ready(this)) {
+            // The bootstrap is downloaded and checked here, before firmwarekit runs, so the edit needs no network.
+            jailbreakRunning = true; jailbreakStep = "Downloading Cydia"; error = ""
+            CydiaBootstrap.start(this) { failure ->
+                handler.post {
+                    if (failure.isNotEmpty()) { jailbreakRunning = false; jailbreakStep = ""; error = failure }
+                    else { jailbreakRunning = false; jailbreakStep = ""; jailbreakSelected() }
+                }
+            }
+            return
+        }
+        jailbreakRunning = true; jailbreakStep = "Starting"; error = ""
+        if (editBound) { unbindService(editConnection); editBound = false }
+        edit = null
+        editBound = bindService(Intent(this, FirmwareService::class.java), editConnection, BIND_AUTO_CREATE)
+        startForegroundService(Intent(this, FirmwareService::class.java))
+        Thread({
+            try {
+                val worker = awaitEditWorker() ?: throw IllegalStateException("The firmware worker did not start")
+                worker.jailbreak(folder.absolutePath)
+                while (true) {
+                    val state = worker.status()
+                    val phase = state.getString("state") ?: "idle"
+                    val stage = state.getString("stage") ?: ""
+                    handler.post { if (jailbreakRunning) jailbreakStep = stage }
+                    if (phase in listOf("complete", "failed", "cancelled")) {
+                        val message = state.getString("error") ?: ""
+                        handler.post {
+                            jailbreakRunning = false; jailbreakStep = ""
+                            if (phase == "complete") notice = "Jailbroken. Start ${device.name} to finish installing Cydia."
+                            else error = message.ifEmpty { "The jailbreak did not finish" }
+                            releaseEdit()
+                        }
+                        return@Thread
+                    }
+                    Thread.sleep(500)
+                }
+            } catch (e: Exception) {
+                handler.post {
+                    jailbreakRunning = false; jailbreakStep = ""
+                    error = e.message ?: "The jailbreak did not start"
+                    releaseEdit()
+                }
+            }
+        }, "jailbreak").start()
+    }
+
+    /** The jailbreak worker binds asynchronously; wait for the binder, then for the service to answer. */
+    private fun awaitEditWorker(): IFirmware? {
+        repeat(60) {
+            edit?.let { return it }
+            Thread.sleep(100)
+        }
+        return edit
+    }
+
+    /** Ends the jailbreak worker's process (its status is spent) and shows the library as it is now. */
+    private fun releaseEdit() {
+        val worker = edit
+        edit = null
+        if (editBound) { unbindService(editConnection); editBound = false }
+        try { worker?.finish() } catch (_: RemoteException) { }
+        refreshDevices()
     }
     private fun workerExitedRun() = Bundle().apply { putString("state", "failed"); putString("error", "The preparation worker stopped unexpectedly. Try again.") }
     private val stockIpsw = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) importStockIpsw(uri) }
@@ -329,6 +454,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
             val guestInFront = overlay == null && !devicesOpen && !licensesOpen && !preparationOpen && status == "running"
             LaunchedEffect(guestInFront) { preferSixtyHertz(guestInFront) }
             // A full page hides the guest surface: the presenter stops drawing into it and drops its 60 Hz request.
+            val guestCovered = overlay in listOf(Screen.LOADING, Screen.SETUP, Screen.SETTINGS, Screen.STORE, Screen.CYDIA)
             val guestCovered = overlay in listOf(Screen.LOADING, Screen.SETUP, Screen.SETTINGS, Screen.STORE, Screen.DETAILS)
             LaunchedEffect(guestCovered, engine) {
                 val worker = engine ?: return@LaunchedEffect
@@ -377,6 +503,10 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
                             onCreate = ::createDevice, onPrepare = { openPreparation() },
                             onFinish = { start -> overlay = null; if (start) startGuest() }, onCancel = { overlay = null })
                         Screen.SETTINGS -> SettingsScreen(this@MainActivity) { overlay = null }
+                        Screen.CYDIA -> CydiaScreen(selected, muxSocket.takeIf { status == "running" && it.isNotEmpty() },
+                            blocked = busy || store.installing,
+                            onPickLocal = { localDeb.launch(arrayOf("application/vnd.debian.binary-package", "application/octet-stream", "*/*")) }) { overlay = null }
+                        Screen.STORE -> StoreScreen(store, running = status == "running" && muxSocket.isNotEmpty() && !CydiaTransfers.active,
                         Screen.DETAILS -> detailsDevice?.let { DeviceDetails(it) { overlay = null; openDevices() } }
                         Screen.STORE -> StoreScreen(store, running = status == "running" && muxSocket.isNotEmpty(),
                             onPickLocal = { localIpa.launch(arrayOf("application/octet-stream", "*/*")) }) { overlay = null }
@@ -461,6 +591,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         Thread({ try { worker.setPresentScale(scale); worker.setDetailedTiming(detailed) } catch (_: RemoteException) { } }, "apply-settings").start()
     }
     override fun selectDevice(id: String) {
+        if (CydiaTransfers.active) return
         busy = true
         val worker = engine
         Thread({
@@ -476,6 +607,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         }, "device-rename").start()
     }
     override fun deleteDevice(id: String) {
+        if (CydiaTransfers.active) return
         val worker = engine ?: return
         busy = true
         Thread({
@@ -741,9 +873,12 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
     private fun PrepareOverlay() {
         val board = prep.firmware?.board
         LaunchedEffect(board, records) { board?.let { findBootrom(it) } }
+        // Cydia's bootstrap may already be in the cache (an earlier preparation): check it off the main thread.
+        LaunchedEffect(prep.firmwareId) { if (prep.jailbreak && prep.firmwareId.isNotEmpty()) checkCydiaBootstrap() }
         PrepareScreen(prep, busy, preparationActive(),
             onDownload = ::downloadIpsw, onChooseIpsw = { stockIpsw.launch(arrayOf("application/octet-stream", "*/*")) },
             onChooseRom = { prepRom.launch(arrayOf("application/octet-stream", "*/*")) }, onDownloadRom = ::downloadBootrom, onPrepare = ::beginPreparation,
+            onJailbreak = ::chooseJailbreak,
             onChoosePrepared = { preparedCopy.launch(null) },
             onCancel = { firmware?.cancel(); prep.preparation = prep.preparation?.apply { putString("state", "cancelling") } },
             onRetryImport = { prep.preparation?.let { importPreparedOutput(it) } }, onAdvanced = ::openDeviceFiles, onClose = ::closePreparation)
@@ -761,10 +896,37 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         setup.reset(firstRun = false); setup.step = SetupStep.FILES; overlay = Screen.SETUP
         scanFolder(uri) { createDevice() }
     }
+    /**
+     * Cydia on or off for the preparation: turning it on downloads and checks the bootstrap here (CydiaBootstrap),
+     * so the preparation itself never needs the network, and Prepare stays disabled until it is in place.
+     */
+    private fun chooseJailbreak(on: Boolean) {
+        prep.jailbreak = on
+        prep.jailbreakError = ""
+        if (!on) { prep.jailbreakReady = false; return }
+        prep.jailbreakReady = false
+        CydiaBootstrap.start(this) { error ->
+            handler.post {
+                prep.jailbreakError = error
+                prep.jailbreakReady = error.isEmpty()
+            }
+        }
+    }
+    /** Whether the bootstrap is already in the cache, when the flow opens on a firmware prepared with Cydia before. */
+    private fun checkCydiaBootstrap() {
+        Thread({
+            val ready = CydiaBootstrap.ready(this)
+            handler.post { prep.jailbreakReady = ready }
+        }, "cydia-check").start()
+    }
     private fun beginPreparation() {
         if (preparationActive() || busy) return
         val chosen = prep.firmware ?: return
         if (!prep.ipswReady || !prep.romReady) return
+        if (prep.jailbreak && !prep.jailbreakReady) {
+            prep.jailbreakError = "Cydia's files are not downloaded yet"
+            return
+        }
         val worker = firmware ?: run { pendingFirmwareStart = true; firmwareRestarting = true; bindFirmware(); return }
         // Ask the worker, not prep.preparation: Back clears that, and a spent worker would refuse start while its
         // status went on reporting the earlier run (its error and firmware id) as this one's.
@@ -772,14 +934,19 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         if (spent) { restartFirmwareForPreparation(); return }
         val selectedIpsw = prep.ipswPath
         val selectedRom = if (needsBootrom(chosen.board)) prep.romPath else ""
+        // 1.x has no jailbreak (FirmwareKit refuses it); the prepare screen does not offer it there either.
+        val jailbreak = prep.jailbreak && CydiaBootstrap.offers(chosen.version)
         prep.importError = ""
-        prep.preparation = Bundle().apply { putString("state", "starting"); putString("firmwareId", chosen.id) }
+        prep.preparation = Bundle().apply {
+            putString("state", "starting"); putString("firmwareId", chosen.id)
+            putString("stage", "Unpacking preparation tools")
+        }
         startForegroundService(Intent(this, FirmwareService::class.java))
         Thread({
             try {
                 // firmwarekit bakes the APK's own guest helpers and packages into the system.
                 val tools = GuestTools.firmwareTools(this)
-                val state = worker.start(chosen.id, selectedIpsw, tools.absolutePath, selectedRom)
+                val state = worker.start(chosen.id, selectedIpsw, tools.absolutePath, selectedRom, jailbreak)
                 handler.post { prep.preparation = state }
             } catch (e: Exception) { handler.post { prep.preparation = Bundle().apply { putString("state", "failed"); putString("error", e.message ?: "Cannot start preparation"); putBoolean("consumed", true) } } }
         }, "prepare-start").start()
@@ -809,8 +976,11 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
     private fun pollPreparation(state: Bundle) {
         if (firmwareRestarting) return
         val phase = state.getString("state")
-        if (phase == "idle" && retainedPreparedOutput.isNotEmpty()) return
-        if (phase == "idle" && prep.preparation?.getString("state") != "starting") { prep.preparation = null; return }
+        if (phase == "idle") {
+            // Guest tools are copied before worker.start(). Polling its idle state must not erase that pending start.
+            if (retainedPreparedOutput.isNotEmpty() || prep.preparation?.getString("state") == "starting") return
+            prep.preparation = null; return
+        }
         // The user went back from a finished run; the worker keeps reporting it until it is replaced.
         if (phase in listOf("failed", "cancelled") && prep.preparation == null) return
         // Shown here, so not again at the next launch.
@@ -1041,6 +1211,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         }, "guest-start").start()
     }
     private fun stopGuest() {
+        if (CydiaTransfers.active) { notice = "Wait for the .deb transfer to finish before stopping iOS."; return }
         val worker = engine ?: return
         engineExpectedExit = true; status = "stopping"; stopSensors()
         Thread({

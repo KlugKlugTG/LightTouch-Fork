@@ -241,7 +241,7 @@ internal class StoreModel(context: Context, private val muxSocket: () -> String?
         background("store-crash") {
             val text = try {
                 apps.lastCrash(socket)?.let { (name, body) ->
-                    val keep = Regex("^(Process|Date/Time|OS Version|Exception Type|Exception Codes|Crashed Thread|Dyld Error Message|  Symbol not found|  Referenced from|  Expected in|Termination Reason|Application Specific Information)")
+                    val keep = Regex("^(Process|Date/Time|Date:|Hardware Model:|OS Version|Exception Type|Exception Code|Reason:|Crashed Thread|Dyld Error Message|  Symbol not found|  Referenced from|  Expected in|Termination Reason|Application Specific Information)")
                     val lines = body.lines()
                     val dyld = lines.indexOfFirst { it.startsWith("Dyld Error Message") }
                     name + "\n\n" + lines.filterIndexed { i, l -> keep.containsMatchIn(l) || (dyld >= 0 && i in dyld + 1..dyld + 3) }
