@@ -113,6 +113,8 @@ private fun ButtonBar(host: GuestHost, modifier: Modifier, onInteract: () -> Uni
                         onClick = { host.settings.overlay = OverlayLevel.entries[(host.settings.overlay.ordinal + 1) % OverlayLevel.entries.size] })
                     DropdownMenuItem(text = { Text("Settings") }, leadingIcon = { Icon(Icons.Filled.Settings, null) },
                         onClick = { menu = false; host.navigate(Screen.SETTINGS) })
+                    DropdownMenuItem(text = { Text("Cydia") }, leadingIcon = { Icon(LtIcons.Package, null) },
+                        onClick = { menu = false; host.navigate(Screen.CYDIA) }, modifier = Modifier.testTag("open_cydia"))
                     HorizontalDivider()
                     DropdownMenuItem(text = { Text("Stop", color = LtColors.Danger) }, leadingIcon = { Icon(LtIcons.Stop, null, tint = LtColors.Danger) },
                         onClick = { menu = false; onStop() }, enabled = host.sessionOwned && host.status != "stopping" && !host.storeInstalling)

@@ -31,16 +31,25 @@ name: Android perf APK
 # the engine step with a cache-refusal message, delete the `lt-engine-*` cache
 # and re-run.
 #
-# Opening a pull request (or pushing to one) starts this workflow too, but it builds nothing until a person
-# confirms it: the `confirm` job holds the run on the `perf-apk` environment, and Approve in the run's review
-# banner lets it go, so a ten-minute engine build does not start on its own while a change is still a draft. A
-# pull request run takes the defaults below and never publishes a pre-release; a manual run keeps its inputs.
-# The environment is repository configuration, not this file: Settings > Environments > `perf-apk` with
-# "Required reviewers" ticks the gate; without one GitHub uses the environment ungated and runs start at once.
+# Opening a pull request (or pushing to one) starts this workflow too, but it
+# builds nothing until a person confirms it: the `confirm` job holds the run on
+# the `perf-apk` environment, which requires a reviewer, and Approve in the run's
+# review banner lets it go. That keeps a 10-minute engine build from starting on
+# its own while a change is still a draft, and keeps runner minutes for the runs
+# someone asked for. A pull request run always takes the defaults below (4 jobs,
+# a debuggable APK, strict verification) and never publishes a pre-release; the
+# manual run keeps its inputs.
+#
+# The environment is repository configuration, not this file: Settings >
+# Environments > New environment, name `perf-apk`, tick "Required reviewers" and
+# add yourself. Until it has a reviewer, GitHub creates/uses the environment
+# without a gate and pull request runs build immediately.
 
 on:
   pull_request:
     branches: [main]
+    # Opened, a new push to the branch, and reopened: each waits for the same
+    # confirmation. Draft pull requests are included; the wait is the point.
     types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
@@ -91,13 +100,17 @@ permissions:
   contents: write
 
 concurrency:
-  # One run per pull request (or per branch of a manual run), so a pull request's build never queues behind a
-  # manual run of another branch.
+  # One run per pull request (or per branch of a manual run): a pull request's
+  # build no longer queues behind a manual run of another branch, and successive
+  # pushes to the same pull request cancel nothing.
   group: android-perf-apk-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # The confirmation a pull request's build waits for. A manual run skips it.
+  # The confirmation a pull request's build waits for. The `perf-apk` environment
+  # requires a reviewer (repository Settings > Environments), so this job sits in
+  # "Waiting for review" and the build starts only after Approve. A manual run
+  # skips it.
   confirm:
     name: Confirm the pull request build
     if: github.event_name == 'pull_request'
@@ -119,13 +132,13 @@ jobs:
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_NDK_VERSION: 28.2.13676358
-      # A pull request run has no inputs: these are the workflow_dispatch defaults. They live here, not inside
-      # the steps, so no ${{ }} can end up inside a shell expansion (a missing brace there swallows the script).
+      # A pull request run has no inputs: these are the defaults the workflow_dispatch
+      # block declares. They live here, not inside the steps, so that no ${{ }} can
+      # end up inside a shell expansion (a missing brace there swallows the script).
       LT_JOBS: ${{ inputs.jobs || '4' }}
       ENGINE_REPO: ${{ inputs.engine_repository || 'KlugKlugTG/qemu-ios' }}
       ENGINE_REF: ${{ inputs.engine_ref || 'perf' }}
-      DECLARED_BASE_RELEASE_REPO: ${{ inputs.base_release_repository || 'blake-lucas/LightTouch' }}
-      DECLARED_BASE_RELEASE_TAG: ${{ inputs.base_release_tag || 'v0.0.10' }}
+      DECLARED_BASE_RELEASE: ${{ inputs.base_release_repository || 'blake-lucas/LightTouch' }} ${{ inputs.base_release_tag || 'v0.0.10' }}
       DECLARED_DEBUGGABLE: ${{ inputs.debuggable || 'true' }}
       DECLARED_DEPENDENCY_VERIFICATION: ${{ inputs.dependency_verification || 'strict' }}
       MESON: ${{ github.workspace }}/meson/bin/meson
@@ -137,8 +150,8 @@ jobs:
       - name: Check out the engine source
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.ENGINE_REPO }}
-          ref: ${{ env.ENGINE_REF }}
+          repository: ${{ inputs.engine_repository || 'KlugKlugTG/qemu-ios' }}
+          ref: ${{ inputs.engine_ref || 'perf' }}
           path: qemu-ios
           fetch-depth: 1
 
@@ -151,8 +164,8 @@ jobs:
       - name: Extract firmwarekit, USB bridge and guest tools from the published APK
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_RELEASE_REPO: ${{ env.DECLARED_BASE_RELEASE_REPO }}
-          BASE_RELEASE_TAG: ${{ env.DECLARED_BASE_RELEASE_TAG }}
+          BASE_RELEASE_REPO: ${{ inputs.base_release_repository || 'blake-lucas/LightTouch' }}
+          BASE_RELEASE_TAG: ${{ inputs.base_release_tag || 'v0.0.10' }}
         run: |
           python3 - <<'PY'
           import fnmatch, json, os, pathlib, re, shutil, subprocess, urllib.request, zipfile
@@ -332,6 +345,11 @@ jobs:
           print(f'extracted firmwarekit, USB bridge and guest tools from {resolved_repo}@{resolved_tag} ({asset_name})')
           PY
 
+      # The APK carries the firmwarekit its base release was built with. That binary predates this branch, and
+      # its Cydia install spawns /usr/bin/tar, a path no Android has: the jailbreak (at preparation and from
+      # Settings on an existing device) fails on the phone. Building the tool here is what puts this branch's
+      # fix in the APK. A failed build must stop packaging rather than ship the old broken jailbreak path.
+      # scripts/build.sh firmwarekit-android is the repository's own recipe (Swift SDK for Android).
       - name: JDK 17
         uses: actions/setup-java@v4
         with:
@@ -343,12 +361,14 @@ jobs:
           df -h / | tail -1
           # The engine build trees, the NDK and Gradle are the three big ones; the
           # image ships several preinstalled NDKs and system images we do not use.
-          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/.ghcup /opt/ghc \
+          # Not /usr/share/swift: the firmwarekit cross-build runs later in this job and needs the image's
+          # Swift toolchain (the SDK for Android is built for its version).
+          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/ghc \
             /usr/local/lib/android/sdk/system-images /usr/local/lib/android/sdk/emulator \
             /usr/local/lib/android/sdk/ndk /usr/local/lib/android/sdk/sources \
             /usr/local/share/chromium /usr/lib/firefox /var/lib/docker/overlay2/* || true
           df -h / /mnt 2>/dev/null | tail -3
-      - name: Install host tools, NDK 28.2 and CMake 3.22.1
+      - name: Install host tools, the NDKs the builds pin and CMake 3.22.1
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ninja-build pkg-config python3-venv perl autoconf automake libtool
@@ -357,9 +377,208 @@ jobs:
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --install "ndk;$ANDROID_NDK_VERSION" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
+          # The Swift SDK for Android's runtime is built against NDK LTS r30 (swift.org's guide); with an
+          # older NDK the link fails on a libc++ symbol the SDK's runtime calls.
+          { "$SDKMANAGER" --list >/tmp/sdks.log 2>&1 || true; }
+          SWIFT_NDK="$(grep -o 'ndk;3[0-9][^ |]*' /tmp/sdks.log | sort -u | tail -1 || true)"
+          if [ -n "$SWIFT_NDK" ]; then
+            "$SDKMANAGER" --install "$SWIFT_NDK"
+            echo "SWIFT_NDK=$ANDROID_HOME/ndk/$(echo "$SWIFT_NDK" | cut -d';' -f2)" >> "$GITHUB_ENV"
+          else
+            echo "::warning::the SDK manager offers no NDK 30; the Swift SDK for Android may not link"
+            echo "::warning::ndk packages the SDK manager knows: $(grep -o 'ndk;[0-9][^ |]*' /tmp/sdks.log | sort -u -V | tail -6 | tr '\n' ' ')"
+          fi
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
           ninja --version
           meson/bin/meson --version
+
+      - name: Build firmwarekit from this branch
+        id: firmwarekit
+        env:
+          LT_SWIFT_ANDROID_SDK: aarch64-unknown-linux-android29
+          LT_SWIFT_ENV: /dev/null
+          SOURCE_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -uo pipefail
+          # The run's log is not readable everywhere, so a failure reports itself through check-run
+          # annotations: one line each, the tail of what went wrong.
+          report() {
+            # One annotation, newlines escaped: a step keeps three of them, and the log is the evidence.
+            if [ -f "$1" ]; then
+              # Errors first, then the tail without compiler warnings and their source snippets:
+              # the step keeps three annotations, and a warning is not what failed the build.
+              echo "::error title=firmwarekit build::$( { grep -E 'error:|fatal error|undefined reference|ld: |cannot find|No such file' "$1" | head -n 12; tail -n 120 "$1" | grep -vE '^[[:space:]]*$|\[[= ]+\]|warning:|^ *[0-9]+ \||^ *\||^ *`- ' | tail -n 20; } \
+                | sed 's/.*\r//; s/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            fi
+            echo "::error::firmwarekit was not built from this branch; refusing to package the old jailbreak implementation"
+            exit 1
+          }
+          # The compiler must match the Android SDK; the runner's preinstalled Swift can be older.
+          if ! command -v swift >/dev/null 2>&1 || ! swift --version | grep -q 'Swift version 6.4.1'; then
+            SWIFT_ROOT="$RUNNER_TEMP/firmwarekit-swift"
+            mkdir -p "$SWIFT_ROOT"
+            curl -fsSL --retry 2 -o "$RUNNER_TEMP/swift-toolchain.tar.gz" \
+              https://download.swift.org/swift-6.4.1-release/ubuntu2404/swift-6.4.1-RELEASE/swift-6.4.1-RELEASE-ubuntu24.04.tar.gz
+            echo "7d246c7114077ad01dba4ad897628446ada4c489d6c7dbcf39ae3f25cbe17e8b  $RUNNER_TEMP/swift-toolchain.tar.gz" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/swift-toolchain.tar.gz" -C "$SWIFT_ROOT"
+            export PATH="$SWIFT_ROOT/swift-6.4.1-RELEASE-ubuntu24.04/usr/bin:$PATH"
+          fi
+          swift --version
+          # swift.org's own install line for the Swift 6.4.1 SDK for Android (its getting-started
+          # article): the bundle is built for that toolchain version, and the checksum is published
+          # with it. The runner's Swift must be 6.4.1 for it to line up; scripts/build.sh picks up the
+          # result through the bundle path below.
+          SDK_URL=https://download.swift.org/swift-6.4.1-release/android-sdk/swift-6.4.1-RELEASE/swift-6.4.1-RELEASE_android.artifactbundle.tar.gz
+          SDK_SHA=a356b79f8f1daa6ae3a66f4c556966ca20c0208b3659805cf30a83a0a31d6772
+          SDK_ROOT="$RUNNER_TEMP/firmwarekit-swift-sdks"
+          BUNDLE="$SDK_ROOT/swift-6.4.1-RELEASE_android.artifactbundle"
+          : >/tmp/swift-sdk.log
+          if [ ! -d "$BUNDLE" ]; then
+            swift sdk list --swift-sdks-path "$SDK_ROOT" 2>/dev/null | sed 's/^/installed Swift SDK: /' >>/tmp/swift-sdk.log || true
+            # swift sdk install downloads through URLSession, which has crashed on Linux mid-install;
+            # fetching with curl and handing it the file keeps that out of the way.
+            echo "curl $SDK_URL" >>/tmp/swift-sdk.log
+            curl -fsSL --retry 2 -o /tmp/android-sdk.tar.gz "$SDK_URL" >>/tmp/swift-sdk.log 2>&1 \
+              || report /tmp/swift-sdk.log
+            echo "$SDK_SHA  /tmp/android-sdk.tar.gz" | sha256sum -c - >>/tmp/swift-sdk.log 2>&1 \
+              || report /tmp/swift-sdk.log
+            swift sdk install --swift-sdks-path "$SDK_ROOT" /tmp/android-sdk.tar.gz >>/tmp/swift-sdk.log 2>&1 || report /tmp/swift-sdk.log
+            echo "installed at: ${BUNDLE:-nowhere}" >>/tmp/swift-sdk.log
+            [ -d "$BUNDLE" ] || report /tmp/swift-sdk.log
+          fi
+          # The bundle cross-compiles against an NDK sysroot the setup script links in (LTS r30 in
+          # swift.org's guide, and the SDK's static runtime wants its libc++).
+          # The setup script links the SDK's runtime against the NDK, so the NDK install step runs before
+          # this one; a missing tree is still worth a line rather than a later linker error.
+          [ -d "$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" ] || echo "::warning::no NDK at $ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          # swift.org's guide asks for NDK LTS r30; the job's own NDK links the sysroot just the same, and
+          # installing another one here (sdkmanager needs its repository, licenses and a few minutes) only
+          # added a way for the step to fail before it compiled anything.
+          # The SDK's Swift runtime calls libc++ symbols that only r30's has
+          # (std::__ndk1::__hash_memory), so the newest NDK on the image is the one to link,
+          # not whichever directory sorts last.
+          NDK_ROOT="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          if [ -n "${SWIFT_NDK:-}" ] && [ -d "$SWIFT_NDK" ]; then NDK_ROOT="$SWIFT_NDK"; fi
+          NEWEST="$(ls -1 "$ANDROID_HOME/ndk" 2>/dev/null | sort -V | tail -1)"
+          [ -n "$NEWEST" ] && NDK_ROOT="$ANDROID_HOME/ndk/$NEWEST"
+          # The Swift SDK's destination JSON consults both variables when it expands its sysroot.
+          # setup-android-sdk.sh only needs HOME, but leaving the job's inherited ROOT on r28 makes
+          # `swift build` silently pass --sysroot .../ndk/28 even after the bundle was set up with r30.
+          export ANDROID_NDK_HOME="$NDK_ROOT"
+          export ANDROID_NDK_ROOT="$NDK_ROOT"
+          echo "NDK root: $NDK_ROOT"
+          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
+          echo "ANDROID_NDK_ROOT: $ANDROID_NDK_ROOT"
+          echo "NDKs present: $(ls -1 "$ANDROID_HOME/ndk" 2>/dev/null | tr '\n' ' ')"
+          # The bundle cross-compiles against an NDK sysroot its setup script links in.
+          if [ -f "$BUNDLE/swift-android/scripts/setup-android-sdk.sh" ]; then
+            bash "$BUNDLE/swift-android/scripts/setup-android-sdk.sh" >/tmp/ndk-setup.log 2>&1 \
+              || report /tmp/ndk-setup.log
+          else
+            echo "no setup-android-sdk.sh in the bundle" >>/tmp/ndk-setup.log
+          fi
+          # The SDK links against the sysroot sitting in its own bundle, and the setup script
+          # fills that from whichever NDK it found. If that one is not the NDK above, the link
+          # dies on a libc++ symbol only r30 has, however correct $NDK_ROOT is.
+          SYSROOT="$BUNDLE/swift-android/ndk-sysroot"
+          SYS_LIBCXX="$SYSROOT/usr/lib/aarch64-linux-android/libc++_static.a"
+          if [ "$(grep -c __hash_memory "$SYS_LIBCXX" 2>/dev/null || echo 0)" = 0 ]; then
+            echo "bundle sysroot's libc++ is not the chosen NDK's; pointing it at $NDK_ROOT"
+            rm -rf "$SYSROOT"
+            ln -s "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot" "$SYSROOT"
+          fi
+          echo "sysroot libc++ has __hash_memory: $(grep -c __hash_memory "$SYS_LIBCXX" 2>/dev/null || echo 0)"
+          cd "$GITHUB_WORKSPACE"
+          # Check bootstrap extraction and the installer before packaging this branch's native build.
+          swift test --package-path Packages/FirmwareKit --jobs "$LT_JOBS" --filter 'CydiaInstallTests|DebInstallerTests' >/tmp/cydia-tests.log 2>&1 \
+            || report /tmp/cydia-tests.log
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq toybox
+          mkdir -p "$RUNNER_TEMP/cydia-toybox"
+          ln -s "$(command -v toybox)" "$RUNNER_TEMP/cydia-toybox/tar"
+          LT_TAR="$RUNNER_TEMP/cydia-toybox/tar" swift test --package-path Packages/FirmwareKit --skip-build --filter 'CydiaInstallTests|DebInstallerTests' >/tmp/cydia-toybox-tests.log 2>&1 \
+            || report /tmp/cydia-toybox-tests.log
+          # The same build scripts/build.sh runs (firmwarekit-android), with the log kept whole: the
+          # script pipes swift build through `tail -3`, which is all a failure would leave behind.
+          cd "$GITHUB_WORKSPACE/Packages/FirmwareKit"
+          # What the build sees, in one place: a mismatch between these is the likeliest reason a cross-build
+          # stops before it compiles anything.
+          LIBCXX="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_static.a"
+          { swift --version; echo "bundle: $BUNDLE"; swift sdk list --swift-sdks-path "$SDK_ROOT"
+            echo "ndk root: $NDK_ROOT"; echo "ndks: $(ls -1 "$ANDROID_HOME/ndk" | tr '\n' ' ')"
+            echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"; echo "ANDROID_NDK_ROOT: $ANDROID_NDK_ROOT"
+            echo "libc++: $LIBCXX"
+            echo "libc++ has __hash_memory: $(grep -c __hash_memory "$LIBCXX" 2>/dev/null || echo 0)"
+            echo "bundle sysroot: $(readlink -f "$BUNDLE/swift-android/ndk-sysroot" 2>/dev/null)"
+            echo "bundle sysroot libc++ has __hash_memory: $(grep -c __hash_memory "$BUNDLE/swift-android/ndk-sysroot/usr/lib/aarch64-linux-android/libc++_static.a" 2>/dev/null || echo 0)"
+            ls -la "$BUNDLE/swift-android/ndk-sysroot" 2>/dev/null | head -5; } 2>&1 \
+            | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}' > /tmp/toolchain.dump
+          echo "::warning title=firmwarekit toolchain::$(cat /tmp/toolchain.dump)"
+          # android-pkgconfig/zlib.pc already selects the r30 static libc++ shim the Swift SDK needs.
+          # Do not add the NDK's root library directory with -L: it contains libc.a, libm.a and
+          # libdl.a, while their shared stubs live under the API-specific directory. Putting the root
+          # first silently links static bionic into a dynamic executable, which crashes even on --help.
+          # Use the same SDK directory as installation; the runner's default store is empty.
+          swift build -c release --product firmwarekit --swift-sdk "$LT_SWIFT_ANDROID_SDK" --swift-sdks-path "$SDK_ROOT" \
+            --scratch-path .build-android --static-swift-stdlib \
+            --pkg-config-path build-support/android-pkgconfig \
+            -Xlinker -lssl -Xlinker -lcrypto >/tmp/firmwarekit.log 2>&1 || report /tmp/firmwarekit.log
+          echo "c++ runtime the link named: $(grep -o -- '-lc\+\+[a-z_]*' /tmp/firmwarekit.log | sort -u | tr '\n' ' ')" >> /tmp/linknote.txt
+          echo "c++ libs the link named: $(grep -o -- '-lc++[a-z_]*' /tmp/firmwarekit.log | sort -u | tr '\n' ' ')" \
+            >> /tmp/linknote.txt
+          PRODUCT=".build-android/out/Products/Release-android-aarch64/firmwarekit"
+          [ -f "$PRODUCT" ] || report /tmp/firmwarekit.log
+          TOOLS="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          OUT="$GITHUB_WORKSPACE/ci/firmwarekit-built/android"
+          rm -rf "$GITHUB_WORKSPACE/ci/firmwarekit-built"
+          mkdir -p "$OUT"
+          cp "$PRODUCT" "$OUT/firmwarekit"
+          "$TOOLS/llvm-strip" "$OUT/firmwarekit"
+          # The one-shot the preparation boots through (Portable/oneshot), as build.sh builds it.
+          "$TOOLS/aarch64-linux-android29-clang" -O2 -Wall -Wextra -Werror -o "$OUT/lighttouch-oneshot" \
+            "$GITHUB_WORKSPACE/Portable/oneshot/lighttouch-oneshot.c" >>/tmp/firmwarekit.log 2>&1 \
+            || report /tmp/firmwarekit.log
+          python3 build-support/stage-notices.py "$OUT/licenses" --checkouts .build-android/checkouts \
+            --swift-license "$BUNDLE/swift-android/swift-resources/usr/share/swift/LICENSE.txt" \
+            --source-reference "https://github.com/$GITHUB_REPOSITORY/tree/$SOURCE_REF" >>/tmp/firmwarekit.log 2>&1 \
+            || report /tmp/firmwarekit.log
+          echo "--- binary needs ---" >> /tmp/linknote.txt
+          "$TOOLS/llvm-readelf" -d "$OUT/firmwarekit" > /tmp/firmwarekit-dynamic.txt 2>&1 \
+            || report /tmp/firmwarekit-dynamic.txt
+          grep NEEDED /tmp/firmwarekit-dynamic.txt >> /tmp/linknote.txt || true
+          if ! grep -Fq 'Shared library: [libc.so]' /tmp/firmwarekit-dynamic.txt; then
+            cat /tmp/firmwarekit-dynamic.txt
+            echo '::error::firmwarekit must dynamically link Android libc.so; static bionic cannot be packaged'
+            exit 1
+          fi
+          for ndk in "$ANDROID_HOME"/ndk/*; do
+            for lib in "$ndk"/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so; do
+              [ -f "$lib" ] || continue
+              echo "$(basename "$ndk") libc++_shared __hash_memory: $(grep -c __hash_memory "$lib" || true)" >> /tmp/linknote.txt
+            done
+          done
+          echo "::notice title=firmwarekit link::$(sed 's/%/%25/g' /tmp/linknote.txt | awk '{printf "%s%%0A", $0}')"
+          ls -la "$OUT"
+          echo "dir=$OUT" >> "$GITHUB_OUTPUT"
+
+      # The base APK's static helper predates upload-deb. Build current source, with a complete recipe cache.
+      - name: Cache guest file services
+        id: mobile_cache
+        uses: actions/cache@v4
+        with:
+          path: ci/mobile-built
+          key: android-mobile-${{ env.ANDROID_NDK_VERSION }}-${{ hashFiles('Android/native-services/lt_appservice.c', 'Android/packaging/build-mobile-android.py', 'Android/packaging/curl-stub/**', 'Android/packaging/patches/**', 'build-support/dependencies.json', 'build-support/patches/libimobiledevice-sslv3-ios1.patch', 'Linux/packaging/patches/usbmuxd-linux-standard-headers.patch', 'Linux/packaging/patches/usbmuxd-private-qemu-config.patch') }}
+
+      - name: Build guest file services from this branch
+        if: steps.mobile_cache.outputs.cache-hit != 'true'
+        run: |
+          python3 Android/packaging/build-mobile-android.py ci/mobile-built \
+            --ndk "$ANDROID_NDK_ROOT" --jobs "$LT_JOBS"
+
+      - name: Stage current guest file services
+        run: |
+          install -m 755 ci/mobile-built/arm64-v8a/liblt_appservice.so ci/mobile-services/arm64-v8a/liblt_appservice.so
+          install -m 755 ci/mobile-built/arm64-v8a/libusbmuxd_qemu.so ci/mobile-services/arm64-v8a/libusbmuxd_qemu.so
 
       # Everything the dependency and engine scripts record in their recipes, as two strings: a cache
       # keyed by them holds a tree those scripts accept, so the build can be skipped instead of run
@@ -434,9 +653,9 @@ jobs:
         with:
           path: ci/engine-build
           # One tree per engine revision; any tree of this recipe is a starting point.
-          key: lt-engine-${{ steps.recipes.outputs.deps }}-${{ steps.recipes.outputs.engine }}-j${{ env.LT_JOBS }}-${{ steps.engine.outputs.sha }}
+          key: lt-engine-${{ steps.recipes.outputs.deps }}-${{ steps.recipes.outputs.engine }}-j${{ inputs.jobs || '4' }}-${{ steps.engine.outputs.sha }}
           restore-keys: |
-            lt-engine-${{ steps.recipes.outputs.deps }}-${{ steps.recipes.outputs.engine }}-j${{ env.LT_JOBS }}-
+            lt-engine-${{ steps.recipes.outputs.deps }}-${{ steps.recipes.outputs.engine }}-j${{ inputs.jobs || '4' }}-
 
       - name: Cache the signing key
         uses: actions/cache@v4
@@ -473,13 +692,23 @@ jobs:
               --dependency-verification="$DECLARED_DEPENDENCY_VERIFICATION" \
               -Pdebuggable="$DECLARED_DEBUGGABLE" "$@"
           }
+          # The compiler's own lines come back through check-run annotations on failure: the run's
+          # log is not readable everywhere, and a Kotlin error there is otherwise invisible.
+          LOG="$RUNNER_TEMP/preflight.log"
+          report() {
+            # The lines after the match are the message ("What went wrong:" is a heading), and an
+            # annotation keeps only a couple of them, so take the error lines and their context.
+            sed -n 's/^/::error title=preflight::/p' \
+              <(grep -A6 -E '^e: |^What went wrong|^Caused by|^> Task .*FAILED|^Execution failed' "$LOG" | head -n 24)
+            exit 1
+          }
           # Resolving the runtime classpath checks the pinned dependency verification; the dry
           # run configures every task without running it.
-          gradlew :app:dependencies --configuration debugRuntimeClasspath > /dev/null
-          gradlew --dry-run :app:assembleDebug
+          gradlew :app:dependencies --configuration debugRuntimeClasspath >"$LOG" 2>&1 || report
+          gradlew --dry-run :app:assembleDebug >>"$LOG" 2>&1 || report
           # AIDL first (Kotlin compiles against its generated interfaces), then Kotlin and Java:
           # what the APK step compiles, none of what it packages.
-          gradlew :app:compileDebugAidl :app:compileDebugKotlin :app:compileDebugJavaWithJavac
+          gradlew :app:compileDebugAidl :app:compileDebugKotlin :app:compileDebugJavaWithJavac >>"$LOG" 2>&1 || report
 
       # A cache hit is a tree the scripts' own recorded recipe accepts (the key is that recipe), so
       # there is nothing to rebuild. Without the skip this step spent ~3.5 minutes on every run
@@ -636,7 +865,13 @@ jobs:
 
       - name: Build the APK
         working-directory: Android
+        env:
+          # Only the successfully rebuilt tool supports this branch's Android jailbreak path.
+          LT_FIRMWAREKIT_DIR: ${{ steps.firmwarekit.outputs.dir }}
+          SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
         run: |
+          : "${LT_FIRMWAREKIT_DIR:?The current FirmwareKit build is required}"
+          echo "firmwarekit: $LT_FIRMWAREKIT_DIR"
           ./gradlew --no-daemon --max-workers="$LT_JOBS" \
             '-Dorg.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m' \
             --dependency-verification="$DECLARED_DEPENDENCY_VERIFICATION" \
@@ -645,11 +880,11 @@ jobs:
             -PportableDir="$GITHUB_WORKSPACE/Portable" \
             -PqemuSource="$GITHUB_WORKSPACE/qemu-ios" \
             -PengineRoot="$GITHUB_WORKSPACE/ci/engine" \
-            -PfirmwareKitDir="$GITHUB_WORKSPACE/ci/firmwarekit/android" \
+            -PfirmwareKitDir="$LT_FIRMWAREKIT_DIR" \
             -PguestToolsDir="$GITHUB_WORKSPACE/ci/guest-tools" \
             -PmobileServicesArm64="$GITHUB_WORKSPACE/ci/mobile-services/arm64-v8a" \
             -PsourceRevision="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" \
-            -PsourceReference="https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}" \
+            -PsourceReference="https://github.com/${SOURCE_REPOSITORY}/tree/$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" \
             -Pdebuggable="$DECLARED_DEBUGGABLE" \
             :app:assembleDebug
 
@@ -682,10 +917,13 @@ jobs:
             exit 1
           }
           echo "- signer: $SIGNED (the workflow's keystore, so an install updates in place)"
-          # check-apk.py targets uncompressed packaging; this APK extracts its
-          # libraries so firmwarekit can run out of nativeLibraryDir.
-          python3 Android/scripts/check-apk.py "$APK" ||
-            echo "::warning::check-apk.py expects uncompressed native libraries; legacy packaging is expected here"
+          # This APK is legacy-packaged on purpose (useLegacyPackaging when
+          # firmwareKitDir is set): its libraries are compressed and extracted so
+          # firmwarekit can run out of nativeLibraryDir. --legacy-packaging drops
+          # the uncompressed-APK assertions and keeps the ELF, PT_LOAD and
+          # packaged-ANGLE ones, which hold either way.
+          python3 Android/scripts/check-apk.py --legacy-packaging "$APK" ||
+            echo "::warning::check-apk.py reported a problem with this APK above (the build still produced one)"
           {
             echo "# Un1box perf APK"
             echo
@@ -694,7 +932,8 @@ jobs:
             echo "- application revision: $(git rev-parse HEAD) ($GITHUB_REPOSITORY)"
             echo "- engine revision: $(git -C qemu-ios rev-parse HEAD) ($ENGINE_REPO $ENGINE_REF)"
             echo "- engine build: arm64-v8a, NDK $ANDROID_NDK_VERSION, --android-api 29, $LT_JOBS jobs"
-            echo "- reused from ${BASE_RELEASE_RESOLVED:-$DECLARED_BASE_RELEASE_REPO $DECLARED_BASE_RELEASE_TAG}: firmwarekit, lighttouch-oneshot, USB bridge, guest tools"
+            echo "- compiled from this branch: firmwarekit and guest file services"
+            echo "- reused from ${BASE_RELEASE_RESOLVED:-$DECLARED_BASE_RELEASE}: lighttouch-oneshot, USB bridge, guest tools"
             echo "- debuggable: $DECLARED_DEBUGGABLE; signed with this workflow's own keystore"
             echo
             echo "## Engine commits in $ENGINE_REF that are not in main"
@@ -721,7 +960,7 @@ jobs:
             ci/PROVENANCE.txt
 
       - name: Attach the APK to a pre-release
-        if: github.event_name == 'workflow_dispatch' && inputs.create_release == 'true'
+        if: inputs.create_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

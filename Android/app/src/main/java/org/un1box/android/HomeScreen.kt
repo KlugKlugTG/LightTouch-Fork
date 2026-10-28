@@ -80,6 +80,7 @@ private fun TopBar(host: GuestHost) {
             Icon(Icons.Filled.KeyboardArrowDown, "Devices", Modifier.padding(start = 4.dp).size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         } }
         IconButton(onClick = { host.navigate(Screen.STORE) }, modifier = Modifier.testTag("open_store")) { Icon(LtIcons.Bag, "Legacy Store") }
+        IconButton(onClick = { host.navigate(Screen.CYDIA) }, modifier = Modifier.testTag("open_cydia")) { Icon(LtIcons.Package, "Cydia") }
         IconButton(onClick = { host.navigate(Screen.SETTINGS) }, modifier = Modifier.testTag("open_settings")) { Icon(Icons.Filled.Settings, "Settings") }
     }
 }

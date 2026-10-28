@@ -89,6 +89,7 @@ internal class StoreInstaller private constructor(private val context: Context) 
 
     /** Normal behaviour once nothing is installing and nobody is looking: the guest pauses, as it does when Un1box is left. */
     private fun pauseGuest() {
+        if (CydiaTransfers.active) return
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, binder: IBinder) {
                 Thread({

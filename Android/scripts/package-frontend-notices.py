@@ -291,7 +291,10 @@ def package(inventory, destination, cache, source_reference, source_revision, su
         supplement = supplemental.get((row["coordinate"], row["sha256"]), {})
         supplied_notices = list(supplement.get("notices", []))
         if upstream_cache:
-            supplied_notices.extend(pinned_supplements(row, meta, upstream_cache, bool(notices), native))
+            # An exact-version supplemental license may cover a publisher outside the pinned Apache recipe.
+            # The original bytes, hash and provenance are still checked below before anything is emitted.
+            has_license = bool(notices) or any(item.get("role") == "license" for item in supplied_notices)
+            supplied_notices.extend(pinned_supplements(row, meta, upstream_cache, has_license, native))
         for item in supplied_notices:
             if not SAFE_PART.fullmatch(item["name"]) or item["name"] in (".", "..") or item.get("role") not in ("license", "notice", "attribution"):
                 raise ValueError("Invalid supplemental notice name/role")

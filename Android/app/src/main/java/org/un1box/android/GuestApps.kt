@@ -85,4 +85,7 @@ internal class GuestApps(private val context: Context) {
 
     fun install(socket: String, ipa: File, bundleId: String, cancelled: () -> Boolean, event: (JSONObject) -> Unit): JSONObject =
         run(socket, listOf("install", "--ipa", ipa.absolutePath, "--bundle-id", bundleId), 900, cancelled, event)
+
+    fun uploadDeb(socket: String, deb: File, name: String, event: (JSONObject) -> Unit): JSONObject =
+        run(socket, listOf("upload-deb", "--deb", deb.absolutePath, "--deb-name", name), 900, event = event)
 }

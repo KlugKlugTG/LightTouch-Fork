@@ -20,19 +20,27 @@ extension StoppedVolumeEdit {
         guard let lock, (Int(lock.productVersion?.split(separator: ".").first ?? "") ?? 0) >= 2 else {
             throw FirmwareError(.unsupported, "the jailbreak needs iPhone OS 2.0 or later")
         }
-        guard !lock.jailbroken else { throw FirmwareError(.unsupported, "this device is jailbroken already") }
         let session = try await begin(device: device, policy: policy, log: log)
         do {
             guard let point = try await mount(device: device, id: session.id, policy: policy).mountPoint else {
                 throw FirmwareError(.internal, "jailbreak: the volume isn't mounted")
             }
+            let mount = URL(fileURLWithPath: point)
             let jb = try SystemEdits.installJailbreak(
-                URL(fileURLWithPath: point),
+                mount,
                 bootstrap: bootstrap,
                 typeinBySubstrate: lock.board == "n72ap"
             )
             log(jb.afc2)
             log(jb.cydia)
+            #if os(Android)
+            if lock.board == "n88ap", lock.productVersion == "5.1.1" {
+                let job = mount.appendingPathComponent("System/Library/LaunchDaemons/com.apple.BTServer.plist")
+                if FileManager.default.fileExists(atPath: job.path) {
+                    try SystemEdits.rewritePlist(job) { $0["Disabled"] = true }
+                }
+            }
+            #endif
             var bootFile: String?
             try await commit(device: device, id: session.id, policy: policy, log: log) { system, base in
                 let volume = try HFSPlusVolume(system, writable: true)
