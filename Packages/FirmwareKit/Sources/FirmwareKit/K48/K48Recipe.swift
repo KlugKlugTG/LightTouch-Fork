@@ -42,6 +42,12 @@ final class K48Board: Board {
     var systemOptions: SystemEdits.Options {
         var o = SystemEdits.Options(recipe: recipe, version: version)
         o.bluetooth = a4.bluetoothHCI
+        #if os(Android)
+        // On the Android n88 5.1.1 jailbreak boot, BTServer's sandboxed BlueTool keeps restarting, then
+        // AppleSimpleUARTSync panics with "Assertion failed: _hwEnabled". Keep that guest job disabled
+        // for this configuration until the controller survives those restarts.
+        if o.jailbreak && board == "n88ap" && version == "5.1.1" { o.bluetooth = false }
+        #endif
         return o
     }
     let recipe: FirmwareEntry.Recipe, version: String, strategy: String, iboot: Bool, dataProtection: Bool

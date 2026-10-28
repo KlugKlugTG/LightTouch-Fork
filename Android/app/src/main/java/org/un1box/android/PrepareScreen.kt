@@ -52,6 +52,11 @@ internal class PrepareState {
     var romError by mutableStateOf("")
     var preparation by mutableStateOf<Bundle?>(null)
     var importError by mutableStateOf("")
+    /** Cydia (`firmwarekit create --jailbreak`), offered from iPhone OS 2.0 on, and its bootstrap's download. */
+    var jailbreak by mutableStateOf(false)
+    var jailbreakError by mutableStateOf("")
+    /** Every bootstrap file is downloaded and matches its SHA-1. */
+    var jailbreakReady by mutableStateOf(false)
     /** Adding the prepared output as a device: the phase shown, and how far it is (negative while unknown). */
     var importPhase by mutableStateOf("")
     var importProgress by mutableFloatStateOf(-1f)
@@ -90,8 +95,8 @@ private fun preparationCost(firmware: CatalogFirmware?) =
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 internal fun PrepareScreen(state: PrepareState, busy: Boolean, preparing: Boolean, onDownload: () -> Unit, onChooseIpsw: () -> Unit,
-                           onChooseRom: () -> Unit, onDownloadRom: () -> Unit, onPrepare: () -> Unit, onChoosePrepared: () -> Unit,
-                           onCancel: () -> Unit, onRetryImport: () -> Unit, onAdvanced: () -> Unit, onClose: () -> Unit) {
+                           onChooseRom: () -> Unit, onDownloadRom: () -> Unit, onPrepare: () -> Unit, onJailbreak: (Boolean) -> Unit,
+                           onChoosePrepared: () -> Unit, onCancel: () -> Unit, onRetryImport: () -> Unit, onAdvanced: () -> Unit, onClose: () -> Unit) {
     val run = state.preparation?.getString("state")
     val showProgress = preparing || run in listOf("complete", "failed", "cancelled")
     val back = {
@@ -120,7 +125,7 @@ internal fun PrepareScreen(state: PrepareState, busy: Boolean, preparing: Boolea
                     state.step == PrepareStep.DEVICE -> DeviceStep(state, onAdvanced)
                     state.step == PrepareStep.VERSION -> VersionStep(state)
                     !state.preparesHere -> PreparedCopyStep(state, busy, onChoosePrepared)
-                    else -> FilesStep(state, busy, onDownload, onChooseIpsw, onChooseRom, onDownloadRom, onPrepare)
+                    else -> FilesStep(state, busy, onDownload, onChooseIpsw, onChooseRom, onDownloadRom, onPrepare, onJailbreak)
                 }
                 Spacer(Modifier.height(24.dp))
             }
@@ -219,6 +224,10 @@ private fun VersionStep(state: PrepareState) {
                 if (firmware.id in state.supported) "" else "\nPrepared on a computer, then added here"
             ChoiceRow(null, "iOS ${firmware.label}", detail, true, "prepare_version_${firmware.id}") {
                 state.firmwareId = firmware.id; state.step = PrepareStep.FILES
+                // 1.x cannot be jailbroken: the option goes with the version it was chosen for.
+                if (!CydiaBootstrap.offers(firmware.version)) {
+                    state.jailbreak = false; state.jailbreakReady = false; state.jailbreakError = ""
+                }
             }
         }
     }
@@ -266,7 +275,7 @@ private fun released(firmware: CatalogFirmware): String {
 
 @Composable
 private fun ColumnScope.FilesStep(state: PrepareState, busy: Boolean, onDownload: () -> Unit, onChooseIpsw: () -> Unit, onChooseRom: () -> Unit,
-                                  onDownloadRom: () -> Unit, onPrepare: () -> Unit) {
+                                  onDownloadRom: () -> Unit, onPrepare: () -> Unit, onJailbreak: (Boolean) -> Unit) {
     val firmware = state.firmware ?: return
     val name = shortProductName(firmware.productType)
     Heading("$name, iOS ${firmware.label}", "Un1box needs Apple's stock IPSW for this version" +
@@ -324,12 +333,42 @@ private fun ColumnScope.FilesStep(state: PrepareState, busy: Boolean, onDownload
             }
         }
     }
+    // Cydia: afc2, Cydia and Substrate, in the same pass over the system volume.
+    if (CydiaBootstrap.offers(firmware.version)) Card(icon = LtIcons.Puzzle, title = "Cydia (jailbreak)",
+        done = state.jailbreak && state.jailbreakReady,
+        detail = if (state.jailbreak) "Cydia, apt and dpkg in the system volume" else "Optional. iOS ${firmware.label} can be prepared jailbroken.") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Jailbreak with Cydia", style = MaterialTheme.typography.titleSmall)
+                Text("Adds Cydia, apt and dpkg, ${if (firmware.version.startsWith("3.")) "and afc2" else "Substrate (the tweak loader) and afc2"}, which serves the whole file system over USB. The first start finishes the install.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Switch(checked = state.jailbreak, onCheckedChange = onJailbreak, enabled = !busy && !CydiaBootstrap.running,
+                modifier = Modifier.testTag("prepare_jailbreak"))
+        }
+        when {
+            CydiaBootstrap.running -> {
+                Spacer(Modifier.height(8.dp))
+                Text(CydiaBootstrap.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(8.dp))
+                if (CydiaBootstrap.progress >= 0f) LinearProgressIndicator(progress = { CydiaBootstrap.progress }, Modifier.fillMaxWidth())
+                else LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+            state.jailbreakError.isNotEmpty() -> Text(state.jailbreakError, Modifier.padding(top = 8.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            state.jailbreak && state.jailbreakReady -> Text("Downloaded and checked.", Modifier.padding(top = 8.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else -> Text("Its files (about 8 MB, each checked against its SHA-1) are downloaded when you turn this on.",
+                Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
     Spacer(Modifier.height(12.dp))
     val cost = preparationCost(firmware)
     Text("Preparing runs on this phone, takes ${cost.time} and needs about ${cost.space} free. Un1box's guest tools are added for you.",
         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     Spacer(Modifier.height(20.dp))
-    Button(onClick = onPrepare, enabled = !busy && state.ipswReady && state.romReady && state.ipswChecking.isEmpty(),
+    Button(onClick = onPrepare,
+        enabled = !busy && state.ipswReady && state.romReady && state.ipswChecking.isEmpty() && (!state.jailbreak || state.jailbreakReady),
         modifier = Modifier.align(Alignment.CenterHorizontally).height(52.dp).testTag("start_preparation"), contentPadding = PaddingValues(horizontal = 32.dp)) {
         Text("Prepare device", style = MaterialTheme.typography.titleMedium)
     }

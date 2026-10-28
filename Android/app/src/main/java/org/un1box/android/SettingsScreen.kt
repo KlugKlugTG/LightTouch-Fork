@@ -32,6 +32,18 @@ internal fun SettingsScreen(host: GuestHost, onBack: () -> Unit) {
     val s = host.settings
     val context = LocalContext.current
     var headphonesInfo by remember { mutableStateOf(false) }
+    // Jailbreaking an existing device asks first: it can't be undone, though the device keeps its data.
+    var confirmJailbreak by remember { mutableStateOf<DeviceSummary?>(null) }
+    confirmJailbreak?.let { device ->
+        AlertDialog(onDismissRequest = { confirmJailbreak = null }, icon = { Icon(LtIcons.Puzzle, null) },
+            title = { Text("Install or update Cydia on ${device.name}?", style = MaterialTheme.typography.titleMedium) },
+            text = { Text("Adds Cydia, apt and dpkg, Substrate (the tweak loader, iOS 3 to 6) and afc2, which serves " +
+                "the whole file system over USB, plus automatic .deb installation. An existing Cydia installation is updated. The device's apps, settings and data stay. It runs while the device " +
+                "is stopped, and can't be undone: Erase returns to it too.") },
+            confirmButton = { Button(onClick = { confirmJailbreak = null; host.jailbreakSelected() },
+                modifier = Modifier.testTag("confirm_jailbreak")) { Text("Install / Update") } },
+            dismissButton = { TextButton(onClick = { confirmJailbreak = null }) { Text("Cancel") } })
+    }
     if (headphonesInfo) AlertDialog(onDismissRequest = { headphonesInfo = false }, icon = { Icon(LtIcons.Headphones, null) },
         title = { Text("Headphones or speaker", style = MaterialTheme.typography.titleMedium) },
         text = { Text("With headphones, iOS plays games and music in stereo, unchanged.\n\n" +
@@ -105,6 +117,13 @@ internal fun SettingsScreen(host: GuestHost, onBack: () -> Unit) {
                         "Start ${host.selected?.name} from its saved data after an unclean shutdown, keeping diagnostics", enabled = !host.busy, tag = "recover_guest") { host.recover(); onBack() }
                 }
                 Group("Device") {
+                    val device = host.selected
+                    // 1.x cannot be jailbroken (firmwarekit refuses it), and a running device's volume is in use.
+                    if (device != null && device.target?.ios?.let { CydiaBootstrap.offers(it) } == true) ActionRow(LtIcons.Puzzle,
+                        if (host.jailbreaking) "Installing Cydia…" else "Install or update Cydia",
+                        if (host.jailbreaking) host.jailbreakStage.ifEmpty { "Editing the system volume" }
+                        else "Cydia and automatic .deb installation for ${device.name}. Its apps and data stay.",
+                        enabled = !host.jailbreaking && !host.active && !host.busy, tag = "jailbreak_device") { confirmJailbreak = device }
                     ActionRow(LtIcons.Puzzle, "Update guest tools", host.selected?.let { "Install a newer .itpack into ${it.name}; it applies at the next start" } ?: "Select a device first",
                         enabled = host.selected != null && !host.active && !host.busy) { host.pickGuestTools() }
                     ActionRow(LtIcons.Download, "Prepare from an IPSW", "Choose a device and iOS version; Un1box downloads Apple's firmware and builds it here",
