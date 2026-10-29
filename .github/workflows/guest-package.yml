@@ -1,0 +1,145 @@
+name: Build iOS guest packages
+
+# This workflow builds only armv6.itpack and armv7.itpack. It does not build the Android APK or QEMU.
+# It runs for the guest GLES patch (or manually); the normal Android APK workflow stays Linux-only.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/guest-package.yml
+      - ci/engine-patches/0011-engine-gles-map-buffer.patch
+  workflow_dispatch:
+    inputs:
+      engine_repository:
+        description: Engine source repository
+        required: true
+        default: KlugKlugTG/qemu-ios
+      engine_ref:
+        description: Engine branch, tag or commit
+        required: true
+        default: perf
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  confirm:
+    name: Confirm the guest-package build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    environment: perf-apk
+    steps:
+      - env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "Approve to build the guest packages for PR #${{ github.event.pull_request.number }}: $PR_TITLE"
+
+  guest-package:
+    name: Build guest itpacks only
+    needs: confirm
+    if: always() && needs.confirm.result != 'failure' && needs.confirm.result != 'cancelled'
+    # Xcode 27.1's linker emits no lazy binds; the legacy iOS linker rewrite rejects those from Xcode 26.
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      ENGINE_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.engine_repository || 'KlugKlugTG/qemu-ios' }}
+      ENGINE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.engine_ref || 'perf' }}
+      GH_TOKEN: ${{ github.token }}
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+
+    steps:
+      - name: Check out Un1box and the patch series
+        uses: actions/checkout@v4
+
+      - name: Check out the engine source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+          path: qemu-ios
+          fetch-depth: 1
+
+      - name: Restore the pinned legacy iOS SDK archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/guest-sdk-archives
+          key: guest-sdk-archives-7ccc15923bc9be1a-2098e67e2a026abf
+
+      - name: Download and verify the iOS 3.1.3 and 3.2 SDKs
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/guest-sdk-archives" "$RUNNER_TEMP/guest-sdks"
+          SDK31="$RUNNER_TEMP/guest-sdk-archives/iPhoneOS3.1.3.sdk.tbz2"
+          SDK32="$RUNNER_TEMP/guest-sdk-archives/iPhoneOS3.2.sdk.tbz2"
+          [ -s "$SDK31" ] || gh api -H 'Accept: application/vnd.github.raw' \
+            /repos/qianjigui/iOS-sdks/git/blobs/030f5aab50534fb8b0cd1d5764810cb7424b721c > "$SDK31"
+          [ -s "$SDK32" ] || gh api -H 'Accept: application/vnd.github.raw' \
+            /repos/qianjigui/iOS-sdks/git/blobs/8cb07f5a5fa988e27bc4f55e795000c36ffa8b1a > "$SDK32"
+          echo '7ccc15923bc9be1a4bd234a41bac38f3fea088f1d83a3b18163b4251dccaedd5  '"$SDK31" | shasum -a 256 -c -
+          echo '2098e67e2a026abf238fb2ff4bb990871b0286b717590854b4c4ad566e6d5be3  '"$SDK32" | shasum -a 256 -c -
+          tar -xjf "$SDK31" -C "$RUNNER_TEMP/guest-sdks"
+          tar -xjf "$SDK32" -C "$RUNNER_TEMP/guest-sdks"
+
+      - name: Apply the engine patch series
+        run: |
+          git -C qemu-ios apply "$GITHUB_WORKSPACE"/ci/engine-patches/*.patch
+
+      - name: Prepare the guest build tools
+        run: |
+          xcodebuild -version
+          xcrun --find clang
+          xcrun ld -v
+          if ! command -v ldid >/dev/null; then brew install ldid; fi
+
+      - name: Build guest packages serial 39
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/guest-package"
+          if ! ARMV6_SDK="$RUNNER_TEMP/guest-sdks/iPhoneOS3.1.3.sdk" \
+               IPAD_SDK="$RUNNER_TEMP/guest-sdks/iPhoneOS3.2.sdk" \
+               bash qemu-ios/contrib/guest-package/build.sh "$OUT" > "$RUNNER_TEMP/guest-package.log" 2>&1; then
+            tail -200 "$RUNNER_TEMP/guest-package.log"
+            exit 1
+          fi
+          if grep -q 'guest-package: warning:' "$RUNNER_TEMP/guest-package.log"; then
+            cat "$RUNNER_TEMP/guest-package.log"
+            for component_log in "$OUT"/logs/*.log; do
+              [ -f "$component_log" ] || continue
+              echo "::group::${component_log##*/}"
+              tail -200 "$component_log"
+              echo '::endgroup::'
+            done
+            echo '::error::guest package build emitted warnings; refusing to upload partial packages'
+            exit 1
+          fi
+          grep -E 'armv6 serial 39|armv7 serial 39|serial 39' "$RUNNER_TEMP/guest-package.log" || true
+          test -s "$OUT/armv6.itpack"
+          test -s "$OUT/armv7.itpack"
+          shasum -a 256 "$OUT/armv6.itpack" "$OUT/armv7.itpack" | tee "$OUT/SHA256SUMS"
+
+      - name: Upload only the guest packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: Un1box-guest-packages-39
+          path: |
+            ${{ runner.temp }}/guest-package/armv6.itpack
+            ${{ runner.temp }}/guest-package/armv7.itpack
+            ${{ runner.temp }}/guest-package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Keep guest build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Un1box-guest-package-build-log
+          path: |
+            ${{ runner.temp }}/guest-package.log
+            ${{ runner.temp }}/guest-package/logs/
+          if-no-files-found: ignore
+          retention-days: 7

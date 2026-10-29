@@ -1,0 +1,417 @@
+From 9e0b2808a21ad9817b8b2743c2157acadf76cf0c Mon Sep 17 00:00:00 2001
+From: Un1box <un1box@localhost>
+Date: Thu, 29 Oct 2026 15:57:06 +0000
+Subject: [PATCH] gles: allocate guest storage lazily for NULL-backed mapped
+ buffers
+
+Asphalt 8's latest crash report shows the next case: its 96-byte buffer was
+created by glBufferData with NULL. The host recognizes glMapBuffer, but has
+no guest address it can return, so map:no-guest-copy still leads to a null
+dereference.
+
+Keep metadata for NULL-backed buffers in the guest GLES shim, keyed by buffer
+name within the sharegroup. When (and only when) the app maps one, allocate
+its guest memory, replace the host's NULL data store with that address, then
+perform the map. This avoids allocating memory for the many NULL-backed
+buffers an app never maps. Free backing on successful reallocation, deletion
+or sharegroup teardown; cap it at the host's existing 64 MiB buffer limit.
+
+The host copies writes back on unmap. Client-backed buffers keep using their
+original guest pointer.
+---
+ contrib/guest-package/VERSION        |   2 +-
+ contrib/it-gles/mbxshim.c            | 141 +++++++++++++++++++++++++--
+ hw/arm/gles-host.c                   | 125 ++++++++++++++++++++++++
+ include/hw/arm/guest-services/gles.h |   4 +
+ 4 files changed, 265 insertions(+), 7 deletions(-)
+
+diff --git a/contrib/guest-package/VERSION b/contrib/guest-package/VERSION
+index 32a6323..fbda499 100644
+--- a/contrib/guest-package/VERSION
++++ b/contrib/guest-package/VERSION
+@@ -1,2 +1,2 @@
+-serial 36
++serial 39
+ version 1.1.34
+diff --git a/contrib/it-gles/mbxshim.c b/contrib/it-gles/mbxshim.c
+index 45e40d3..7f12831 100644
+--- a/contrib/it-gles/mbxshim.c
++++ b/contrib/it-gles/mbxshim.c
+@@ -103,11 +103,21 @@ static unsigned slen(const char *s) { unsigned n = 0; while (s && s[n]) n++; ret
+ #define GLES_OP_NEW_CONTEXT 0x1006
+ #define GLES_OP_DELETE_CONTEXT 0x1007
+ 
+-/* api and sg are glishim.c's (the GLEngine replacement, which #includes this
+- * file); the MBX path leaves them zero. */
++/* api is known to the GLEngine replacement; the stock MBX ABI leaves it
++ * unknown. sg is the sharegroup for this context, used to own guest buffer
++ * storage shared by its contexts. */
++typedef struct GuestMapStorage {
++    unsigned name, size, usage;
++    void *data;                  /* allocated lazily, only if glMapBuffer is called */
++    struct GuestMapStorage *next;
++} GuestMapStorage;
++
+ typedef struct {
+     unsigned host, unpack_alignment, api, owns_sg; void *sg; unsigned unpack_row_bytes;
+     unsigned *batch, batch_len;   /* glishim's command buffer (GLES_BATCH); unused on the MBX path */
++    /* Buffer bindings are per context; NULL-data buffer backing is per sharegroup. */
++    unsigned array_buffer, element_buffer;
++    GuestMapStorage *map_storage;
+ } GuestGC;
+ extern void *calloc(unsigned long, unsigned long);
+ extern void free(void *);
+@@ -643,7 +653,12 @@ static int s_texSubImage2D(void *gc, unsigned target, unsigned level,
+       return (int)qc(307, gc, 9,
+                      A(target, level, xoff, yoff, wd_, ht, fmt, type, pixels)); }
+ static int s_bindBuffer(void *gc, unsigned target, unsigned buf)
+-    { return (int)qc(642, gc, 2, A(target, buf)); }
++    {
++        int result = (int)qc(642, gc, 2, A(target, buf));
++        if (gc && target == 0x8892) ((GuestGC *)gc)->array_buffer = buf;
++        if (gc && target == 0x8893) ((GuestGC *)gc)->element_buffer = buf;
++        return result;
++    }
+ static int s_scalex(void *gc, unsigned x, unsigned y, unsigned z)
+     { return (int)qc(796, gc, 3, A(x, y, z)); }
+ 
+@@ -723,12 +738,121 @@ static int s_compressedTexSubImage2D(void *gc, unsigned target, unsigned level,
+                      A(target, level, xoff, yoff, wd_, ht, fmt, imgsz, data)); }
+ static int s_genBuffers(void *gc, unsigned n, unsigned ids)
+     { return (int)qc(644, gc, 2, A(n, ids)); }
++
++/* glBufferData(NULL) is legal: the driver allocates storage for later mapping.
++ * The host cannot allocate guest virtual memory, so the sharegroup owns a small
++ * guest-side backing allocation for each such buffer. The host keeps its own
++ * copy for drawing; glMapBuffer returns this guest address and glUnmapBuffer
++ * copies the app's writes back. */
++#define GLES_MAP_BUFFER_MAX_BYTES (64u * 1024u * 1024u)
++static GuestGC *map_storage_owner(void *gc)
++{
++    GuestGC *context = gc;
++    return context && context->sg ? (GuestGC *)context->sg : context;
++}
++static GuestMapStorage *map_storage_find(GuestGC *owner, unsigned name)
++{
++    for (GuestMapStorage *item = owner ? owner->map_storage : 0; item; item = item->next) {
++        if (item->name == name) return item;
++    }
++    return 0;
++}
++static void map_storage_drop(GuestGC *owner, unsigned name)
++{
++    if (!owner || !name) return;
++    GuestMapStorage **link = &owner->map_storage;
++    while (*link) {
++        GuestMapStorage *item = *link;
++        if (item->name == name) {
++            *link = item->next;
++            free(item->data);
++            free(item);
++            return;
++        }
++        link = &item->next;
++    }
++}
++static void map_storage_clear(GuestGC *owner)
++{
++    if (!owner) return;
++    while (owner->map_storage) {
++        GuestMapStorage *item = owner->map_storage;
++        owner->map_storage = item->next;
++        free(item->data);
++        free(item);
++    }
++}
+ static int s_deleteBuffers(void *gc, unsigned n, unsigned ids)
+-    { return (int)qc(643, gc, 2, A(n, ids)); }
++    {
++        GuestGC *owner = map_storage_owner(gc);
++        if (n && ids && n <= 0x3fffffffu &&
++            guest_fault_read(ids, n * sizeof(unsigned))) {
++            const unsigned *names = (const unsigned *)(unsigned long)ids;
++            for (unsigned i = 0; i < n; i++) map_storage_drop(owner, names[i]);
++        }
++        return (int)qc(643, gc, 2, A(n, ids));
++    }
+ static int s_bufferData(void *gc, unsigned target, unsigned size,
+                         unsigned data, unsigned usage)
+-    { guest_fault_read(data, size);
+-      return (int)qc(646, gc, 4, A(target, size, data, usage)); }
++    {
++        GuestGC *context = gc;
++        GuestGC *owner = map_storage_owner(gc);
++        unsigned name = context ? (target == 0x8893 ? context->element_buffer :
++                                   context->array_buffer) : 0;
++        GuestMapStorage *storage = 0;
++
++        /* Keep only metadata for NULL stores: most are never mapped, so do not
++         * allocate guest memory until the app actually asks glMapBuffer for it. */
++        if (!data && size && size <= GLES_MAP_BUFFER_MAX_BYTES && name && owner) {
++            storage = calloc(1, sizeof(*storage));
++            if (storage) {
++                storage->name = name;
++                storage->size = size;
++                storage->usage = usage;
++            }
++        }
++        guest_fault_read(data, size);
++        int result = (int)qc(646, gc, 4, A(target, size, data, usage));
++        if (result < 0) {
++            free(storage);
++            return result;
++        }
++        map_storage_drop(owner, name);
++        if (storage) {
++            storage->next = owner->map_storage;
++            owner->map_storage = storage;
++        }
++        return result;
++    }
++static void *s_mapBuffer(void *gc, unsigned target, unsigned access)
++    {
++        GuestGC *context = gc;
++        GuestGC *owner = map_storage_owner(gc);
++        unsigned name = context ? (target == 0x8893 ? context->element_buffer :
++                                   context->array_buffer) : 0;
++        GuestMapStorage *storage = map_storage_find(owner, name);
++
++        if (storage && !storage->data) {
++            storage->data = calloc(1, storage->size);
++            if (!storage->data) {
++                long long failed = qc(649, gc, 2, A(target, access));
++                return failed > 0 ? (void *)(unsigned long)failed : 0;
++            }
++            unsigned guest = (unsigned)(unsigned long)storage->data;
++            guest_fault_read(guest, storage->size);
++            /* Replace the host's NULL store with this guest-owned storage so
++             * the host can return its address from the following map call. */
++            if (qc(646, gc, 4, A(target, storage->size, guest, storage->usage)) < 0) {
++                free(storage->data);
++                storage->data = 0;
++                return 0;
++            }
++        }
++        long long mapped = qc(649, gc, 2, A(target, access));
++        return mapped > 0 ? (void *)(unsigned long)mapped : 0;
++    }
++static int s_unmapBuffer(void *gc, unsigned target)
++    { return (int)qc(650, gc, 1, A(target)); }
+ static int s_bufferSubData(void *gc, unsigned target, unsigned offset,
+                            unsigned size, unsigned data)
+     { guest_fault_read(data, size);
+@@ -757,6 +881,7 @@ static int GLESCreateSharegroup(void **out)
+ static int GLESDestroySharegroup(void *sg)
+ {
+     if (sg && ((GuestGC *)sg)->host) qc(GLES_OP_DELETE_SHAREGROUP, 0, 1, A(((GuestGC *)sg)->host));
++    map_storage_clear(sg); // sharegroup storage outlives its contexts
+     free(sg);
+     return 0;
+ }
+@@ -950,6 +1075,8 @@ static void gles_hand_table(void **table)
+         table[643] = (void *)s_deleteBuffers;
+         table[644] = (void *)s_genBuffers;
+         table[646] = (void *)s_bufferData;
++        table[649] = (void *)s_mapBuffer;
++        table[650] = (void *)s_unmapBuffer;
+         table[647] = (void *)s_bufferSubData;
+ 
+         table[60]  = (void *)s_depthFunc;
+@@ -982,6 +1109,7 @@ static int GLESCreateGCWithAPI(void *sharegroup, void **fw_table, void *x_end,
+         gc->host = (unsigned)host;
+     }
+     gc->api = api;
++    gc->sg = sharegroup;
+     w("[mbxshim] GLESCreateGC\n");
+ 
+     if (fw_table) {
+@@ -1077,6 +1205,7 @@ static int GLESDestroyGC(void *gc)
+ {
+     ca_detach_view(ca_view_for_gc(gc, 0));
+     if (gc && ((GuestGC *)gc)->host) qc(GLES_OP_DELETE_CONTEXT, gc, 0, A(0));
++    if (gc && !((GuestGC *)gc)->sg) map_storage_clear(gc);
+     free(gc);
+     return 0;
+ }
+diff --git a/hw/arm/gles-host.c b/hw/arm/gles-host.c
+index a9204b3..0fa0b71 100644
+--- a/hw/arm/gles-host.c
++++ b/hw/arm/gles-host.c
+@@ -290,6 +290,21 @@ typedef struct {
+     size_t size;
+     uint32_t name;
+     unsigned refs;
++    /*
++     * Where this buffer's bytes live in the guest's own address space: the
++     * pointer the app handed glBufferData. MBX has no vertex hardware, so the
++     * stock driver keeps client memory as the buffer rather than copying it,
++     * and glMapBuffer hands that same pointer back -- see the GLES_SLOT_MAP_BUFFER case.
++     * Zero when the buffer was allocated with a NULL data pointer, because then
++     * the storage would have to come from the guest's allocator, which the host
++     * cannot call.
++     */
++    uint32_t guest_ptr;
++    /* The outstanding mapping: guest VA, byte count and the access mode it was
++     * made with. Non-zero map_ptr means mapped. */
++    uint32_t map_ptr;
++    uint32_t map_size;
++    uint32_t map_access;
+ } GLESBuffer;
+ 
+ typedef struct {
+@@ -4381,6 +4396,10 @@ static float gles_f(uint32_t bits)
+ /* A guest buffer big enough to matter is a few MB of geometry; anything past
+  * this is a corrupt size, and g_malloc aborts QEMU rather than failing. */
+ #define GLES_MAX_BUFFER_BYTES ((size_t)64 * 1024 * 1024)
++/* OES_mapbuffer access values: WRITE_ONLY_OES is 0x88B9. */
++#define GLES_MAP_READ_ONLY  0x88B8
++#define GLES_MAP_WRITE_ONLY 0x88B9
++#define GLES_MAP_READ_WRITE 0x88BA
+ 
+ static void gles_buffer_destroy(gpointer p)
+ {
+@@ -4436,6 +4455,25 @@ static GLESBuffer *gles_buffer_bound(uint32_t target)
+     return (GLESBuffer *)gh.array_buffer;
+ }
+ 
++/*
++ * The mapping the app left open on the other target, for the apps that unbind a
++ * buffer before unmapping it. GL only promises the binding is unchanged at
++ * unmap, but losing the mapping because of it would strand the app's data, so
++ * an open mapping anywhere is answered instead of GL_FALSE.
++ */
++static GLESBuffer *gles_other_mapping(const GLESBuffer *bound)
++{
++    GLESBuffer *buffers[] = { gh.array_buffer, gh.element_buffer };
++    unsigned i;
++
++    for (i = 0; i < ARRAY_SIZE(buffers); i++) {
++        if (buffers[i] && buffers[i] != bound && buffers[i]->map_ptr) {
++            return buffers[i];
++        }
++    }
++    return NULL;
++}
++
+ /*
+  * Forget every reference to a buffer that is about to be freed.
+  *
+@@ -7057,6 +7095,10 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
+         }
+         b->data = g_realloc(b->data, n ? n : 1);
+         b->size = n;
++        /* A new allocation ends any mapping and moves the buffer's guest copy:
++         * the old pointer, if the app gave one, is not this buffer's any more. */
++        b->map_ptr = b->map_size = 0;
++        b->guest_ptr = a[2] && n ? a[2] : 0;
+         /* A NULL data pointer means "allocate, contents undefined" -- the
+          * alloc-then-glBufferSubData idiom. Zero it so an app that draws
+          * before filling gets degenerate geometry rather than whatever the
+@@ -7105,6 +7147,89 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
+         return 0;
+     }
+ 
++    /*
++     * OES_mapbuffer: how an app fills a buffer without a second copy of the
++     * data. There is no host buffer object to map and no host page table to map
++     * into -- the buffer's bytes are in `data` here -- so the mapping is the
++     * guest copy the buffer already has: the client array the app passed to
++     * glBufferData. That is the same contract the stock MBX driver has, since it
++     * cannot copy into vertex hardware either; the app keeps that array alive
++     * while the buffer lives, and glUnmapBuffer reads back what it wrote.
++     *
++     * Returning 0 for this call used to be silent, and it crashed the guest
++     * rather than drawing wrong: Asphalt 8 memcpy's its indices into the result
++     * without checking it, so a missing mapping reached us as a SIGSEGV in
++     * libsystem_c called from the game, with nothing in the log to say why.
++     */
++    case GLES_SLOT_MAP_BUFFER: {                /* target, access */
++        GLESBuffer *b = gles_buffer_bound(a[0]);
++
++        if (!b || !b->size) {
++            if (gles_refuse("map:no-buffer:0x%x", a[0])) {
++                fprintf(stderr, "[gles] glMapBuffer: no buffer with contents bound "
++                        "to 0x%x\n", a[0]);
++            }
++            return gles_reject(GL_INVALID_OPERATION);
++        }
++        if (b->map_ptr) {
++            /* Mapping a mapped buffer is an error; the app keeps the pointer it
++             * already has rather than losing the only handle to the mapping. */
++            return b->map_ptr;
++        }
++        if (!b->guest_ptr) {
++            if (gles_refuse("map:no-guest-copy")) {
++                fprintf(stderr, "[gles] glMapBuffer: buffer %u (%zu bytes) was given "
++                        "a NULL data pointer, so it has no guest memory to map; "
++                        "returning 0 and the guest is likely to fault\n",
++                        b->name, b->size);
++            }
++            return 0;
++        }
++        /* A read mapping starts from what the buffer holds now. A write mapping
++         * does not need the copy: the app is about to overwrite it. */
++        if (a[1] == GLES_MAP_READ_ONLY || a[1] == GLES_MAP_READ_WRITE) {
++            if (gles_guest_rw(cpu, b->guest_ptr, b->data, b->size, 1) != 0) {
++                if (gles_refuse("map:guest-write")) {
++                    fprintf(stderr, "[gles] glMapBuffer: cannot write %zu bytes to "
++                            "guest 0x%08x; the mapping is refused\n",
++                            b->size, b->guest_ptr);
++                }
++                return 0;
++            }
++        }
++        b->map_ptr = b->guest_ptr;
++        b->map_size = b->size;
++        b->map_access = a[1];
++        if (gles_refuse("map:%u", b->name)) {
++            fprintf(stderr, "[gles] glMapBuffer: buffer %u (%zu bytes) mapped at "
++                    "guest 0x%08x, access 0x%x\n", b->name, b->size,
++                    b->map_ptr, b->map_access);
++        }
++        return b->map_ptr;
++    }
++
++    case GLES_SLOT_UNMAP_BUFFER: {              /* target */
++        GLESBuffer *bound = gles_buffer_bound(a[0]);
++        GLESBuffer *mapped = bound && bound->map_ptr ? bound : gles_other_mapping(bound);
++
++        if (!mapped) {
++            /* GL_FALSE, as a real driver answers when nothing was mapped. */
++            return 0;
++        }
++        if (mapped->map_access != GLES_MAP_READ_ONLY &&
++            gles_guest_rw(cpu, mapped->map_ptr, mapped->data, mapped->map_size, 0) != 0) {
++            if (gles_refuse("unmap:guest-read")) {
++                fprintf(stderr, "[gles] glUnmapBuffer: cannot read back %u bytes from "
++                        "guest 0x%08x; the buffer keeps its old contents\n",
++                        mapped->map_size, mapped->map_ptr);
++            }
++            mapped->map_ptr = mapped->map_size = 0;
++            return 0;
++        }
++        mapped->map_ptr = mapped->map_size = 0;
++        return 1;
++    }
++
+     case GLES_SLOT_GET_INTEGERV:
+     case GLES_SLOT_GET_BOOLEANV:
+     case GLES_SLOT_GET_FLOATV: {
+diff --git a/include/hw/arm/guest-services/gles.h b/include/hw/arm/guest-services/gles.h
+index 4b12cdf..0ddf601 100644
+--- a/include/hw/arm/guest-services/gles.h
++++ b/include/hw/arm/guest-services/gles.h
+@@ -291,6 +291,10 @@ static inline const char *gles_id_name(uint32_t id)
+ #define GLES_SLOT_GEN_BUFFERS                  GLES_ID_glGenBuffers  /* 0x0a20 */
+ #define GLES_SLOT_BUFFER_DATA                  GLES_ID_glBufferData  /* 0x0a28 */
+ #define GLES_SLOT_BUFFER_SUB_DATA              GLES_ID_glBufferSubData  /* 0x0a2c */
++/* OES_mapbuffer: the pair that hands the app a pointer into its own memory to
++ * fill a buffer through, instead of a second array to upload. */
++#define GLES_SLOT_MAP_BUFFER                   GLES_ID_glMapBuffer     /* 0x0289 */
++#define GLES_SLOT_UNMAP_BUFFER                 GLES_ID_glUnmapBuffer   /* 0x028a */
+ 
+ /* OES framebuffer-object entry points. EAGL uses these itself inside
+  * -renderbufferStorage:fromDrawable:, so a real CAEAGLLayer client cannot get
+-- 
+2.39.5
+
