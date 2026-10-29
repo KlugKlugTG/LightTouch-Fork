@@ -43,13 +43,14 @@ jobs:
     name: Build guest itpacks only
     needs: confirm
     if: always() && needs.confirm.result != 'failure' && needs.confirm.result != 'cancelled'
-    runs-on: macos-26
+    # Xcode 27.1's linker emits no lazy binds; the legacy iOS linker rewrite rejects those from Xcode 26.
+    runs-on: xcode-27
     timeout-minutes: 120
     env:
       ENGINE_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.engine_repository || 'KlugKlugTG/qemu-ios' }}
       ENGINE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.engine_ref || 'perf' }}
       GH_TOKEN: ${{ github.token }}
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
 
     steps:
       - name: Check out Un1box and the patch series
@@ -92,6 +93,7 @@ jobs:
         run: |
           xcodebuild -version
           xcrun --find clang
+          xcrun ld -v
           if ! command -v ldid >/dev/null; then brew install ldid; fi
 
       - name: Build guest packages serial 37
