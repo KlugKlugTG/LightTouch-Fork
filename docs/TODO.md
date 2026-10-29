@@ -334,8 +334,9 @@ iPad, the iPod touch 1G and the original iPhone (never booted off the Mac), iOS 
   tails. "Record the next launch (30 s)" captures the guest's syslog relay while the app starts,
   which the crash report cannot replay. The relay itself has never been exercised on a device.
 - [ ] Asphalt 8's latest report was a null write in `libsystem_c.dylib`, called from Asphalt8. The
-  paired engine log identifies the cause: `glMapBuffer` (GLES id 649) was unimplemented and returned
-  0. A build patch now maps the guest buffer storage instead; verify the patched build and game on a phone.
+  engine log narrows it down: `glMapBuffer` could not return storage because the game's 96-byte
+  buffer was created with `glBufferData(..., NULL, ...)`. The GLES shim now allocates guest-side
+  backing for this case and the host maps it; verify the patched build and game on a phone.
 
 - [x] Battle Bears: Zombies! was guest-CPU-bound (desktop ~24 fps, Pixel 22): its OpenFeint 2.9.1 `_mainDefault:`
   thread spins on an empty run loop. Guest tools serial 31 make that wait sleep (gles-public); 29.6–29.7 fps, the

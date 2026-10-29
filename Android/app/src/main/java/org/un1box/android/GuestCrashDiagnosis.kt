@@ -41,6 +41,13 @@ internal object GuestCrashDiagnosis {
      * `UNHANDLED glMapBuffer (id 649) -- returning 0`.
      */
     fun engineHint(engine: List<String>): String? {
+        // More specific than a generic missing-entrypoint hint: the app requested a buffer with NULL data,
+        // and the bridge had no guest-side memory to hand back from glMapBuffer.
+        if (engine.any { it.contains("REFUSED map:no-guest-copy") }) {
+            return "The engine's own log says glMapBuffer had no guest memory to return: the buffer was created " +
+                "with a NULL data pointer, so the bridge returned 0. That points to missing GLES buffer "
+                "storage in the emulator, not an app-version mismatch."
+        }
         // An entry point that answered nothing is the stronger evidence of the two, so it wins wherever it is.
         engine.asReversed().firstNotNullOfOrNull { Regex("""UNHANDLED (\w+) \(id (\d+)\)""").find(it) }
             ?.let { return "The engine's own log says the GL bridge did not implement ${it.groupValues[1]} " +

@@ -89,6 +89,15 @@ class GuestCrashReportTest {
         assertNull(GuestCrashDiagnosis.engineHint(listOf("[boot] first lit frame after 0.0 s wall")))
     }
 
+    @Test fun nullBufferStorageHintExplainsTheFollowupCrash() {
+        val hint = GuestCrashDiagnosis.engineHint(listOf(
+            "[gles] glMapBuffer: buffer 1 (96 bytes) was given a NULL data pointer, so it has no guest memory to map; returning 0 and the guest is likely to fault",
+            "[gles] REFUSED map:no-guest-copy"))
+        assertNotNull(hint)
+        assertTrue("null-backed buffer is identified as the emulator-side gap", hint!!.contains("NULL data pointer"))
+        assertTrue(hint.contains("emulator"))
+    }
+
     @Test fun diagnosisIncludesTheEnginesOwnLogTail() {
         val state = File.createTempFile("state", "").let { it.delete(); it.mkdirs(); it }
         try {
