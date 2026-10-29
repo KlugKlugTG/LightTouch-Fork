@@ -43,7 +43,7 @@ internal object GuestCrashDiagnosis {
     fun engineHint(engine: List<String>): String? {
         // An entry point that answered nothing is the stronger evidence of the two, so it wins wherever it is.
         engine.asReversed().firstNotNullOfOrNull { Regex("""UNHANDLED (\w+) \(id (\d+)\)""").find(it) }
-            ?.let { return "The engine's own log says the GL bridge does not implement ${it.groupValues[1]} " +
+            ?.let { return "The engine's own log says the GL bridge did not implement ${it.groupValues[1]} " +
                 "(id ${it.groupValues[2]}) and answered 0: if this crash came right after that, the value the app " +
                 "used was ours, not the app's." }
         engine.asReversed().firstNotNullOfOrNull { Regex("""REFUSED (\S+)""").find(it) }

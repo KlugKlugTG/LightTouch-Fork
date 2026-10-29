@@ -1,0 +1,214 @@
+From 499bc3f1f747c8330f0a70650973de27b72ec72f Mon Sep 17 00:00:00 2001
+From: Un1box <un1box@localhost>
+Date: Thu, 29 Oct 2026 15:19:21 +0000
+Subject: [PATCH] gles: map the buffer the app gave us, instead of answering
+ null
+
+OES_mapbuffer was one of the entry points the host has no case for, so
+glMapBuffer fell through to the default and returned 0 -- "the guest will
+render wrong", except the guest does not render: Asphalt 8 memcpy's its
+indices into the result and dies with EXC_BAD_ACCESS at 0x0 inside
+libsystem_c, called from its own code. The crash report was the only place
+that came back, and it pointed at the game.
+
+There is no host buffer object to map here -- a buffer's bytes live in
+`data`, because the draw path marshals them itself -- and no way to make the
+guest's allocator hand us storage. But a buffer that was created from a
+client array already has guest memory, and that is exactly what the stock
+MBX driver maps: it has no vertex hardware to copy into, so the client
+pointer is the buffer, and glMapBuffer hands it back. So keep the pointer
+glBufferData was given in the buffer, return it from glMapBuffer, and copy
+what the app wrote back into our copy in glUnmapBuffer. A read mapping is
+filled from our copy first; a buffer allocated with a NULL data pointer has
+no guest memory to map, is reported once, and still answers 0.
+
+glUnmapBuffer also answers a mapping left open on the other target: GL asks
+for the binding to be unchanged, but answering GL_FALSE would strand the
+app's data.
+---
+ hw/arm/gles-host.c                   | 125 +++++++++++++++++++++++++++
+ include/hw/arm/guest-services/gles.h |   4 +
+ 2 files changed, 129 insertions(+)
+
+diff --git a/hw/arm/gles-host.c b/hw/arm/gles-host.c
+index a9204b3..0fa0b71 100644
+--- a/hw/arm/gles-host.c
++++ b/hw/arm/gles-host.c
+@@ -290,6 +290,21 @@ typedef struct {
+     size_t size;
+     uint32_t name;
+     unsigned refs;
++    /*
++     * Where this buffer's bytes live in the guest's own address space: the
++     * pointer the app handed glBufferData. MBX has no vertex hardware, so the
++     * stock driver keeps client memory as the buffer rather than copying it,
++     * and glMapBuffer hands that same pointer back -- see the GLES_SLOT_MAP_BUFFER case.
++     * Zero when the buffer was allocated with a NULL data pointer, because then
++     * the storage would have to come from the guest's allocator, which the host
++     * cannot call.
++     */
++    uint32_t guest_ptr;
++    /* The outstanding mapping: guest VA, byte count and the access mode it was
++     * made with. Non-zero map_ptr means mapped. */
++    uint32_t map_ptr;
++    uint32_t map_size;
++    uint32_t map_access;
+ } GLESBuffer;
+ 
+ typedef struct {
+@@ -4381,6 +4396,10 @@ static float gles_f(uint32_t bits)
+ /* A guest buffer big enough to matter is a few MB of geometry; anything past
+  * this is a corrupt size, and g_malloc aborts QEMU rather than failing. */
+ #define GLES_MAX_BUFFER_BYTES ((size_t)64 * 1024 * 1024)
++/* OES_mapbuffer access modes. */
++#define GLES_MAP_READ_ONLY  0x88B9
++#define GLES_MAP_WRITE_ONLY 0x88BB
++#define GLES_MAP_READ_WRITE 0x88BA
+ 
+ static void gles_buffer_destroy(gpointer p)
+ {
+@@ -4436,6 +4455,25 @@ static GLESBuffer *gles_buffer_bound(uint32_t target)
+     return (GLESBuffer *)gh.array_buffer;
+ }
+ 
++/*
++ * The mapping the app left open on the other target, for the apps that unbind a
++ * buffer before unmapping it. GL only promises the binding is unchanged at
++ * unmap, but losing the mapping because of it would strand the app's data, so
++ * an open mapping anywhere is answered instead of GL_FALSE.
++ */
++static GLESBuffer *gles_other_mapping(const GLESBuffer *bound)
++{
++    GLESBuffer *buffers[] = { gh.array_buffer, gh.element_buffer };
++    unsigned i;
++
++    for (i = 0; i < ARRAY_SIZE(buffers); i++) {
++        if (buffers[i] && buffers[i] != bound && buffers[i]->map_ptr) {
++            return buffers[i];
++        }
++    }
++    return NULL;
++}
++
+ /*
+  * Forget every reference to a buffer that is about to be freed.
+  *
+@@ -7057,6 +7095,10 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
+         }
+         b->data = g_realloc(b->data, n ? n : 1);
+         b->size = n;
++        /* A new allocation ends any mapping and moves the buffer's guest copy:
++         * the old pointer, if the app gave one, is not this buffer's any more. */
++        b->map_ptr = b->map_size = 0;
++        b->guest_ptr = a[2] && n ? a[2] : 0;
+         /* A NULL data pointer means "allocate, contents undefined" -- the
+          * alloc-then-glBufferSubData idiom. Zero it so an app that draws
+          * before filling gets degenerate geometry rather than whatever the
+@@ -7105,6 +7147,89 @@ static int64_t gles_host_call_1(CPUState *cpu, uint32_t slot, uint32_t ctx,
+         return 0;
+     }
+ 
++    /*
++     * OES_mapbuffer: how an app fills a buffer without a second copy of the
++     * data. There is no host buffer object to map and no host page table to map
++     * into -- the buffer's bytes are in `data` here -- so the mapping is the
++     * guest copy the buffer already has: the client array the app passed to
++     * glBufferData. That is the same contract the stock MBX driver has, since it
++     * cannot copy into vertex hardware either; the app keeps that array alive
++     * while the buffer lives, and glUnmapBuffer reads back what it wrote.
++     *
++     * Returning 0 for this call used to be silent, and it crashed the guest
++     * rather than drawing wrong: Asphalt 8 memcpy's its indices into the result
++     * without checking it, so a missing mapping reached us as a SIGSEGV in
++     * libsystem_c called from the game, with nothing in the log to say why.
++     */
++    case GLES_SLOT_MAP_BUFFER: {                /* target, access */
++        GLESBuffer *b = gles_buffer_bound(a[0]);
++
++        if (!b || !b->size) {
++            if (gles_refuse("map:no-buffer:0x%x", a[0])) {
++                fprintf(stderr, "[gles] glMapBuffer: no buffer with contents bound "
++                        "to 0x%x\n", a[0]);
++            }
++            return gles_reject(GL_INVALID_OPERATION);
++        }
++        if (b->map_ptr) {
++            /* Mapping a mapped buffer is an error; the app keeps the pointer it
++             * already has rather than losing the only handle to the mapping. */
++            return b->map_ptr;
++        }
++        if (!b->guest_ptr) {
++            if (gles_refuse("map:no-guest-copy")) {
++                fprintf(stderr, "[gles] glMapBuffer: buffer %u (%zu bytes) was given "
++                        "a NULL data pointer, so it has no guest memory to map; "
++                        "returning 0 and the guest is likely to fault\n",
++                        b->name, b->size);
++            }
++            return 0;
++        }
++        /* A read mapping starts from what the buffer holds now. A write mapping
++         * does not need the copy: the app is about to overwrite it. */
++        if (a[1] == GLES_MAP_READ_ONLY || a[1] == GLES_MAP_READ_WRITE) {
++            if (gles_guest_rw(cpu, b->guest_ptr, b->data, b->size, 1) != 0) {
++                if (gles_refuse("map:guest-write")) {
++                    fprintf(stderr, "[gles] glMapBuffer: cannot write %zu bytes to "
++                            "guest 0x%08x; the mapping is refused\n",
++                            b->size, b->guest_ptr);
++                }
++                return 0;
++            }
++        }
++        b->map_ptr = b->guest_ptr;
++        b->map_size = b->size;
++        b->map_access = a[1];
++        if (gles_refuse("map:%u", b->name)) {
++            fprintf(stderr, "[gles] glMapBuffer: buffer %u (%zu bytes) mapped at "
++                    "guest 0x%08x, access 0x%x\n", b->name, b->size,
++                    b->map_ptr, b->map_access);
++        }
++        return b->map_ptr;
++    }
++
++    case GLES_SLOT_UNMAP_BUFFER: {              /* target */
++        GLESBuffer *bound = gles_buffer_bound(a[0]);
++        GLESBuffer *mapped = bound && bound->map_ptr ? bound : gles_other_mapping(bound);
++
++        if (!mapped) {
++            /* GL_FALSE, as a real driver answers when nothing was mapped. */
++            return 0;
++        }
++        if (mapped->map_access != GLES_MAP_READ_ONLY &&
++            gles_guest_rw(cpu, mapped->map_ptr, mapped->data, mapped->map_size, 0) != 0) {
++            if (gles_refuse("unmap:guest-read")) {
++                fprintf(stderr, "[gles] glUnmapBuffer: cannot read back %u bytes from "
++                        "guest 0x%08x; the buffer keeps its old contents\n",
++                        mapped->map_size, mapped->map_ptr);
++            }
++            mapped->map_ptr = mapped->map_size = 0;
++            return 0;
++        }
++        mapped->map_ptr = mapped->map_size = 0;
++        return 1;
++    }
++
+     case GLES_SLOT_GET_INTEGERV:
+     case GLES_SLOT_GET_BOOLEANV:
+     case GLES_SLOT_GET_FLOATV: {
+diff --git a/include/hw/arm/guest-services/gles.h b/include/hw/arm/guest-services/gles.h
+index 4b12cdf..0ddf601 100644
+--- a/include/hw/arm/guest-services/gles.h
++++ b/include/hw/arm/guest-services/gles.h
+@@ -291,6 +291,10 @@ static inline const char *gles_id_name(uint32_t id)
+ #define GLES_SLOT_GEN_BUFFERS                  GLES_ID_glGenBuffers  /* 0x0a20 */
+ #define GLES_SLOT_BUFFER_DATA                  GLES_ID_glBufferData  /* 0x0a28 */
+ #define GLES_SLOT_BUFFER_SUB_DATA              GLES_ID_glBufferSubData  /* 0x0a2c */
++/* OES_mapbuffer: the pair that hands the app a pointer into its own memory to
++ * fill a buffer through, instead of a second array to upload. */
++#define GLES_SLOT_MAP_BUFFER                   GLES_ID_glMapBuffer     /* 0x0289 */
++#define GLES_SLOT_UNMAP_BUFFER                 GLES_ID_glUnmapBuffer   /* 0x028a */
+ 
+ /* OES framebuffer-object entry points. EAGL uses these itself inside
+  * -renderbufferStorage:fromDrawable:, so a real CAEAGLLayer client cannot get
+-- 
+2.39.5
+

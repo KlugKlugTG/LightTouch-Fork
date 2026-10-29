@@ -551,7 +551,7 @@ jobs:
           git -C qemu-ios add -A
           GIT_AUTHOR_DATE=2001-01-01T00:00:00Z GIT_COMMITTER_DATE=2001-01-01T00:00:00Z \
             git -C qemu-ios -c user.name=ci -c user.email=ci@localhost \
-            commit -q -m "ci: engine patches (slirp DNS, GLES, TCG fast paths, microphone)"
+            commit -q -m "ci: engine patches (slirp DNS, GLES, TCG fast paths, microphone, buffer mapping)"
           git -C qemu-ios log --oneline -1
           git -C qemu-ios status --porcelain
 
