@@ -106,6 +106,12 @@ jobs:
           fi
           if grep -q 'guest-package: warning:' "$RUNNER_TEMP/guest-package.log"; then
             cat "$RUNNER_TEMP/guest-package.log"
+            for component_log in "$OUT"/logs/*.log; do
+              [ -f "$component_log" ] || continue
+              echo "::group::${component_log##*/}"
+              tail -200 "$component_log"
+              echo '::endgroup::'
+            done
             echo '::error::guest package build emitted warnings; refusing to upload partial packages'
             exit 1
           fi
@@ -130,6 +136,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Un1box-guest-package-build-log
-          path: ${{ runner.temp }}/guest-package.log
+          path: |
+            ${{ runner.temp }}/guest-package.log
+            ${{ runner.temp }}/guest-package/logs/
           if-no-files-found: ignore
           retention-days: 7
