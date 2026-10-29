@@ -419,7 +419,7 @@ diff --git a/include/hw/arm/guest-services/gles.h b/include/hw/arm/guest-service
 index 4b12cdf..0ddf601 100644
 --- a/include/hw/arm/guest-services/gles.h
 +++ b/include/hw/arm/guest-services/gles.h
-@@ -291,7 +291,10 @@ static inline const char *gles_id_name(uint32_t id)
+@@ -291,6 +291,10 @@ static inline const char *gles_id_name(uint32_t id)
  #define GLES_SLOT_GEN_BUFFERS                  GLES_ID_glGenBuffers  /* 0x0a20 */
  #define GLES_SLOT_BUFFER_DATA                  GLES_ID_glBufferData  /* 0x0a28 */
  #define GLES_SLOT_BUFFER_SUB_DATA              GLES_ID_glBufferSubData  /* 0x0a2c */
