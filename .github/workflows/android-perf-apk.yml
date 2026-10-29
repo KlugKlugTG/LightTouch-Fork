@@ -8,11 +8,11 @@ name: Android perf APK
 # (libun1box_jni.so) and the engine (libqemu-arm.so) from the requested
 # engine ref.
 #
-# What is reused: the pieces that are not part of what is being tested and that
-# cannot be built off a Mac — firmwarekit (device preparation), its one-shot
-# booter, the USB bridge and the guest tools. They are extracted from a
-# published release APK (base_release_repository/base_release_tag) so the APK
-# stays usable on a phone.
+# What is normally reused: firmwarekit (device preparation), its one-shot booter,
+# the USB bridge and the guest tools are extracted from a published release APK
+# (base_release_repository/base_release_tag). When a PR changes the guest GLES
+# shim, the guest itpacks are instead rebuilt on macOS from the pinned legacy SDKs
+# and overlaid into this APK, so source changes really reach the guest.
 #
 # The APK is signed with a keystore generated on the first run and reused after
 # that, so successive runs of this workflow update each other in place. It is
@@ -86,9 +86,17 @@ on:
           - "true"
           - "false"
         default: "true"
+      rebuild_guest_tools:
+        description: Rebuild the iOS guest packages from engine source (macOS + legacy SDK build)
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "false"
 
 permissions:
   contents: write
+  pull-requests: read
 
 concurrency:
   # One run per pull request (or per branch of a manual run), so a pull request's build never queues behind a
@@ -97,6 +105,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Keep the costly legacy guest-tool build conditional: a change to the GLES guest shim must be
+  # packaged into new itpacks, while unrelated APK builds continue to reuse the release's itpacks.
+  detect-guest-tools:
+    name: Detect guest-tool source changes
+    runs-on: ubuntu-24.04
+    outputs:
+      rebuild: ${{ steps.detect.outputs.rebuild }}
+    steps:
+      - name: Check whether this run changes the guest GLES shim
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_REBUILD: ${{ inputs.rebuild_guest_tools || 'false' }}
+        run: |
+          rebuild=false
+          if [ "$EVENT_NAME" = pull_request ]; then
+            files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename')"
+            if printf '%s\n' "$files" | grep -Fxq 'ci/engine-patches/0011-engine-gles-map-buffer.patch'; then
+              rebuild=true
+            fi
+          elif [ "$MANUAL_REBUILD" = true ]; then
+            rebuild=true
+          fi
+          echo "rebuild=$rebuild" >> "$GITHUB_OUTPUT"
+          echo "guest tools rebuild required: $rebuild"
+
   # The confirmation a pull request's build waits for. A manual run skips it.
   confirm:
     name: Confirm the pull request build
@@ -110,10 +146,104 @@ jobs:
           echo "Approved: building ${{ github.event.pull_request.head.sha }} of ${{ github.event.pull_request.head.repo.full_name }}"
           echo "pull request #${{ github.event.pull_request.number }}: $PR_TITLE"
 
+  guest-tools:
+    name: Rebuild the iOS guest packages
+    needs: [confirm, detect-guest-tools]
+    if: >-
+      always() &&
+      needs.confirm.result != 'failure' &&
+      needs.confirm.result != 'cancelled' &&
+      needs.detect-guest-tools.result == 'success' &&
+      needs.detect-guest-tools.outputs.rebuild == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      ENGINE_REPO: ${{ inputs.engine_repository || 'KlugKlugTG/qemu-ios' }}
+      ENGINE_REF: ${{ inputs.engine_ref || 'perf' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v4
+
+      - name: Check out the engine source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+          path: qemu-ios
+          fetch-depth: 1
+
+      - name: Restore the pinned legacy iOS SDK archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/guest-sdk-archives
+          key: guest-sdk-archives-7ccc15923bc9be1a-2098e67e2a026abf
+
+      - name: Download and verify iOS 3.1.3 and 3.2 SDKs
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/guest-sdk-archives" "$RUNNER_TEMP/guest-sdks"
+          SDK31="$RUNNER_TEMP/guest-sdk-archives/iPhoneOS3.1.3.sdk.tbz2"
+          SDK32="$RUNNER_TEMP/guest-sdk-archives/iPhoneOS3.2.sdk.tbz2"
+          [ -s "$SDK31" ] || gh api -H 'Accept: application/vnd.github.raw' \
+            /repos/qianjigui/iOS-sdks/git/blobs/030f5aab50534fb8b0cd1d5764810cb7424b721c > "$SDK31"
+          [ -s "$SDK32" ] || gh api -H 'Accept: application/vnd.github.raw' \
+            /repos/qianjigui/iOS-sdks/git/blobs/8cb07f5a5fa988e27bc4f55e795000c36ffa8b1a > "$SDK32"
+          echo '7ccc15923bc9be1a4bd234a41bac38f3fea088f1d83a3b18163b4251dccaedd5  '"$SDK31" | shasum -a 256 -c -
+          echo '2098e67e2a026abf238fb2ff4bb990871b0286b717590854b4c4ad566e6d5be3  '"$SDK32" | shasum -a 256 -c -
+          tar -xjf "$SDK31" -C "$RUNNER_TEMP/guest-sdks"
+          tar -xjf "$SDK32" -C "$RUNNER_TEMP/guest-sdks"
+
+      - name: Apply the engine and guest-tool patch series
+        run: |
+          git -C qemu-ios apply "$GITHUB_WORKSPACE"/ci/engine-patches/*.patch
+          git -C qemu-ios status --short | head -30
+
+      - name: Install ldid
+        run: |
+          if ! command -v ldid >/dev/null; then brew install ldid; fi
+          xcode-select -p
+          xcrun --find clang
+
+      - name: Build guest packages with the updated GLES shim
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/guest-package"
+          if ! ARMV6_SDK="$RUNNER_TEMP/guest-sdks/iPhoneOS3.1.3.sdk" \
+               IPAD_SDK="$RUNNER_TEMP/guest-sdks/iPhoneOS3.2.sdk" \
+               bash qemu-ios/contrib/guest-package/build.sh "$OUT" > "$RUNNER_TEMP/guest-package.log" 2>&1; then
+            tail -200 "$RUNNER_TEMP/guest-package.log"
+            exit 1
+          fi
+          if grep -q 'guest-package: warning:' "$RUNNER_TEMP/guest-package.log"; then
+            cat "$RUNNER_TEMP/guest-package.log"
+            echo '::error::guest package build emitted warnings; refusing to ship a partial itpack'
+            exit 1
+          fi
+          tail -40 "$RUNNER_TEMP/guest-package.log"
+          test -s "$OUT/armv6.itpack"
+          test -s "$OUT/armv7.itpack"
+          shasum -a 256 "$OUT/armv6.itpack" "$OUT/armv7.itpack"
+
+      - name: Upload rebuilt guest itpacks
+        uses: actions/upload-artifact@v4
+        with:
+          name: un1box-guest-itpacks-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/guest-package/armv6.itpack
+            ${{ runner.temp }}/guest-package/armv7.itpack
+          if-no-files-found: error
+          retention-days: 7
+
   perf-apk:
-    needs: confirm
-    # A skipped confirmation (a manual run) is fine; a rejected or cancelled one is not.
-    if: always() && needs.confirm.result != 'failure' && needs.confirm.result != 'cancelled'
+    needs: [confirm, detect-guest-tools, guest-tools]
+    # A skipped confirmation (manual run) and skipped conditional guest build are fine; failures are not.
+    if: >-
+      always() &&
+      needs.confirm.result != 'failure' &&
+      needs.confirm.result != 'cancelled' &&
+      needs.detect-guest-tools.result == 'success' &&
+      (needs.guest-tools.result == 'success' || needs.guest-tools.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
@@ -331,6 +461,21 @@ jobs:
                   env_file.write(f'BASE_RELEASE_RESOLVED={resolved_repo} {resolved_tag} ({asset_name})\n')
           print(f'extracted firmwarekit, USB bridge and guest tools from {resolved_repo}@{resolved_tag} ({asset_name})')
           PY
+
+      - name: Download rebuilt guest itpacks
+        if: needs.detect-guest-tools.outputs.rebuild == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: un1box-guest-itpacks-${{ github.run_id }}
+          path: ci/rebuilt-guest-tools
+
+      - name: Replace release guest itpacks with the patched packages
+        if: needs.detect-guest-tools.outputs.rebuild == 'true'
+        run: |
+          cp ci/rebuilt-guest-tools/armv6.itpack ci/guest-tools/armv6.itpack
+          cp ci/rebuilt-guest-tools/armv7.itpack ci/guest-tools/armv7.itpack
+          echo "GUEST_TOOLS_REBUILT=true" >> "$GITHUB_ENV"
+          sha256sum ci/guest-tools/armv6.itpack ci/guest-tools/armv7.itpack
 
       - name: JDK 17
         uses: actions/setup-java@v4
@@ -670,6 +815,7 @@ jobs:
       - name: Check the APK and write provenance
         env:
           GH_TOKEN: ${{ github.token }}
+          GUEST_TOOLS_REBUILT: ${{ needs.detect-guest-tools.outputs.rebuild }}
         run: |
           ENGINE_SHORT="$(git -C qemu-ios rev-parse --short HEAD)"
           APK="ci/Un1box-${ENGINE_SHORT}-arm64-debug.apk"
@@ -694,7 +840,13 @@ jobs:
             echo "- application revision: $(git rev-parse HEAD) ($GITHUB_REPOSITORY)"
             echo "- engine revision: $(git -C qemu-ios rev-parse HEAD) ($ENGINE_REPO $ENGINE_REF)"
             echo "- engine build: arm64-v8a, NDK $ANDROID_NDK_VERSION, --android-api 29, $LT_JOBS jobs"
-            echo "- reused from ${BASE_RELEASE_RESOLVED:-$DECLARED_BASE_RELEASE_REPO $DECLARED_BASE_RELEASE_TAG}: firmwarekit, lighttouch-oneshot, USB bridge, guest tools"
+            echo "- reused from ${BASE_RELEASE_RESOLVED:-$DECLARED_BASE_RELEASE_REPO $DECLARED_BASE_RELEASE_TAG}: firmwarekit, lighttouch-oneshot and USB bridge"
+            if [ "$GUEST_TOOLS_REBUILT" = true ]; then
+              echo "- guest tools: rebuilt from qemu-ios source, package serial 37 (GLES NULL-buffer mapping); SHA-256:"
+              sha256sum ci/guest-tools/armv6.itpack ci/guest-tools/armv7.itpack | sed 's|^|  - |'
+            else
+              echo "- guest tools: reused from ${BASE_RELEASE_RESOLVED:-$DECLARED_BASE_RELEASE_REPO $DECLARED_BASE_RELEASE_TAG}"
+            fi
             echo "- debuggable: $DECLARED_DEBUGGABLE; signed with this workflow's own keystore"
             echo
             echo "## Engine commits in $ENGINE_REF that are not in main"
