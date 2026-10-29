@@ -46,8 +46,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 120
     env:
-      ENGINE_REPO: ${{ inputs.engine_repository }}
-      ENGINE_REF: ${{ inputs.engine_ref }}
+      ENGINE_REPO: ${{ github.event_name == 'workflow_dispatch' && inputs.engine_repository || 'KlugKlugTG/qemu-ios' }}
+      ENGINE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.engine_ref || 'perf' }}
       GH_TOKEN: ${{ github.token }}
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
 
