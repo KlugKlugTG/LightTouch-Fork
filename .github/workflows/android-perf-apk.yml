@@ -8,11 +8,10 @@ name: Android perf APK
 # (libun1box_jni.so) and the engine (libqemu-arm.so) from the requested
 # engine ref.
 #
-# What is reused: the pieces that are not part of what is being tested and that
-# cannot be built off a Mac — firmwarekit (device preparation), its one-shot
-# booter, the USB bridge and the guest tools. They are extracted from a
-# published release APK (base_release_repository/base_release_tag) so the APK
-# stays usable on a phone.
+# What is reused: firmwarekit (device preparation), its one-shot booter, the
+# USB bridge and it_seal are extracted from a published release APK. The two
+# guest itpacks are then replaced with a matching serial-37 artifact from the
+# guest-package workflow, so the host-side engine fix ships with its guest side.
 #
 # The APK is signed with a keystore generated on the first run and reused after
 # that, so successive runs of this workflow update each other in place. It is
@@ -60,6 +59,10 @@ on:
         description: Release tag for those inputs (e.g. v0.0.10, or "latest")
         required: false
         default: v0.0.10
+      guest_package_run_id:
+        description: Successful guest-package workflow run to use (blank selects the latest compatible run on this branch)
+        required: false
+        default: ""
       jobs:
         description: Parallel compile jobs (the engine scripts ask for -j2 explicitly)
         required: true
@@ -88,6 +91,7 @@ on:
         default: "true"
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -331,6 +335,55 @@ jobs:
                   env_file.write(f'BASE_RELEASE_RESOLVED={resolved_repo} {resolved_tag} ({asset_name})\n')
           print(f'extracted firmwarekit, USB bridge and guest tools from {resolved_repo}@{resolved_tag} ({asset_name})')
           PY
+
+      - name: Overlay guest packages serial 37
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RUN_ID: ${{ inputs.guest_package_run_id || '' }}
+          PACKAGE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          WORKFLOW_ID=400843872
+          CURRENT_PATCH_SHA="$(git hash-object ci/engine-patches/0011-engine-gles-map-buffer.patch)"
+          CURRENT_WORKFLOW_SHA="$(git hash-object .github/workflows/guest-package.yml)"
+          if [ -n "$REQUESTED_RUN_ID" ]; then
+            CANDIDATES="$REQUESTED_RUN_ID"
+          else
+            CANDIDATES="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?branch=$PACKAGE_BRANCH&per_page=100" \
+              --jq '.workflow_runs | map(select(.conclusion == "success")) | sort_by(.created_at) | reverse | map(.id) | .[]')"
+          fi
+
+          SELECTED_RUN=""
+          while IFS= read -r RUN_ID; do
+            [ -n "$RUN_ID" ] || continue
+            HAS_ARTIFACT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.name == "Un1box-guest-packages-37" and .expired == false)] | length')"
+            [ "$HAS_ARTIFACT" -gt 0 ] || continue
+            PACKAGE_SHA="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq '.head_sha')"
+            PATCH_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/ci/engine-patches/0011-engine-gles-map-buffer.patch?ref=$PACKAGE_SHA" --jq '.sha')"
+            WORKFLOW_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/guest-package.yml?ref=$PACKAGE_SHA" --jq '.sha')"
+            if [ "$PATCH_SHA" = "$CURRENT_PATCH_SHA" ] && [ "$WORKFLOW_SHA" = "$CURRENT_WORKFLOW_SHA" ]; then
+              SELECTED_RUN="$RUN_ID"
+              break
+            fi
+            echo "Skipping guest-package run $RUN_ID: its patch or build workflow differs from this APK source."
+          done <<< "$CANDIDATES"
+
+          [ -n "$SELECTED_RUN" ] || {
+            echo '::error::No successful serial-37 guest-package artifact matches this branch and source. Build/approve that workflow first, or provide guest_package_run_id.'
+            exit 1
+          }
+          PACKAGE_DIR="$RUNNER_TEMP/guest-packages-37"
+          mkdir -p "$PACKAGE_DIR"
+          gh run download "$SELECTED_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name Un1box-guest-packages-37 --dir "$PACKAGE_DIR"
+          test -s "$PACKAGE_DIR/armv6.itpack"
+          test -s "$PACKAGE_DIR/armv7.itpack"
+          (cd "$PACKAGE_DIR" && sha256sum -c SHA256SUMS)
+          install -m 0644 "$PACKAGE_DIR/armv6.itpack" ci/guest-tools/armv6.itpack
+          install -m 0644 "$PACKAGE_DIR/armv7.itpack" ci/guest-tools/armv7.itpack
+          echo "GUEST_PACKAGE_RUN_ID=$SELECTED_RUN" >> "$GITHUB_ENV"
+          echo "Overlaid serial-37 armv6/armv7 itpacks from workflow run $SELECTED_RUN."
 
       - name: JDK 17
         uses: actions/setup-java@v4
@@ -694,7 +747,8 @@ jobs:
             echo "- application revision: $(git rev-parse HEAD) ($GITHUB_REPOSITORY)"
             echo "- engine revision: $(git -C qemu-ios rev-parse HEAD) ($ENGINE_REPO $ENGINE_REF)"
             echo "- engine build: arm64-v8a, NDK $ANDROID_NDK_VERSION, --android-api 29, $LT_JOBS jobs"
-            echo "- reused from ${BASE_RELEASE_RESOLVED:-$DECLARED_BASE_RELEASE_REPO $DECLARED_BASE_RELEASE_TAG}: firmwarekit, lighttouch-oneshot, USB bridge, guest tools"
+            echo "- reused from ${BASE_RELEASE_RESOLVED:-$DECLARED_BASE_RELEASE_REPO $DECLARED_BASE_RELEASE_TAG}: firmwarekit, lighttouch-oneshot, USB bridge, it_seal"
+            echo "- guest itpacks: serial 37 from guest-package run ${GUEST_PACKAGE_RUN_ID}"
             echo "- debuggable: $DECLARED_DEBUGGABLE; signed with this workflow's own keystore"
             echo
             echo "## Engine commits in $ENGINE_REF that are not in main"
