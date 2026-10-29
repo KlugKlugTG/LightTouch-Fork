@@ -346,28 +346,42 @@ jobs:
           WORKFLOW_ID=400843872
           CURRENT_PATCH_SHA="$(git hash-object ci/engine-patches/0011-engine-gles-map-buffer.patch)"
           CURRENT_WORKFLOW_SHA="$(git hash-object .github/workflows/guest-package.yml)"
-          if [ -n "$REQUESTED_RUN_ID" ]; then
-            CANDIDATES="$REQUESTED_RUN_ID"
-          else
-            CANDIDATES="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?branch=$PACKAGE_BRANCH&per_page=100" \
-              --jq '.workflow_runs | map(select(.conclusion == "success")) | sort_by(.created_at) | reverse | map(.id) | .[]')"
-          fi
-
           SELECTED_RUN=""
-          while IFS= read -r RUN_ID; do
-            [ -n "$RUN_ID" ] || continue
-            HAS_ARTIFACT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.name == "Un1box-guest-packages-39" and .expired == false)] | length')"
-            [ "$HAS_ARTIFACT" -gt 0 ] || continue
-            PACKAGE_SHA="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq '.head_sha')"
-            PATCH_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/ci/engine-patches/0011-engine-gles-map-buffer.patch?ref=$PACKAGE_SHA" --jq '.sha')"
-            WORKFLOW_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/guest-package.yml?ref=$PACKAGE_SHA" --jq '.sha')"
-            if [ "$PATCH_SHA" = "$CURRENT_PATCH_SHA" ] && [ "$WORKFLOW_SHA" = "$CURRENT_WORKFLOW_SHA" ]; then
-              SELECTED_RUN="$RUN_ID"
-              break
+          for attempt in $(seq 1 30); do
+            if [ -n "$REQUESTED_RUN_ID" ]; then
+              CANDIDATES="$REQUESTED_RUN_ID"
+            else
+              CANDIDATES="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?branch=$PACKAGE_BRANCH&per_page=100" \
+                --jq '.workflow_runs | map(select(.conclusion == "success")) | sort_by(.created_at) | reverse | map(.id) | .[]')"
             fi
-            echo "Skipping guest-package run $RUN_ID: its patch or build workflow differs from this APK source."
-          done <<< "$CANDIDATES"
+
+            while IFS= read -r RUN_ID; do
+              [ -n "$RUN_ID" ] || continue
+              HAS_ARTIFACT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+                --jq '[.artifacts[] | select(.name == "Un1box-guest-packages-39" and .expired == false)] | length')"
+              [ "$HAS_ARTIFACT" -gt 0 ] || continue
+              PACKAGE_SHA="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq '.head_sha')"
+              PATCH_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/ci/engine-patches/0011-engine-gles-map-buffer.patch?ref=$PACKAGE_SHA" --jq '.sha')"
+              WORKFLOW_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/guest-package.yml?ref=$PACKAGE_SHA" --jq '.sha')"
+              if [ "$PATCH_SHA" = "$CURRENT_PATCH_SHA" ] && [ "$WORKFLOW_SHA" = "$CURRENT_WORKFLOW_SHA" ]; then
+                SELECTED_RUN="$RUN_ID"
+                break
+              fi
+              echo "Skipping guest-package run $RUN_ID: its patch or build workflow differs from this APK source."
+            done <<< "$CANDIDATES"
+            [ -n "$SELECTED_RUN" ] && break
+
+            if [ -n "$REQUESTED_RUN_ID" ]; then
+              PACKAGE_STATUS="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REQUESTED_RUN_ID" --jq '.status')"
+              [ "$PACKAGE_STATUS" != completed ] || break
+            else
+              PENDING_RUNS="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?branch=$PACKAGE_BRANCH&per_page=100" \
+                --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | length')"
+              [ "$PENDING_RUNS" -gt 0 ] || break
+            fi
+            echo "Waiting for a matching serial-39 guest-package artifact ($attempt/30)..."
+            sleep 20
+          done
 
           [ -n "$SELECTED_RUN" ] || {
             echo '::error::No successful serial-39 guest-package artifact matches this branch and source. Build/approve that workflow first, or provide guest_package_run_id.'
