@@ -155,7 +155,8 @@ jobs:
       needs.confirm.result != 'cancelled' &&
       needs.detect-guest-tools.result == 'success' &&
       needs.detect-guest-tools.outputs.rebuild == 'true'
-    runs-on: macos-26
+    # macOS 15 has a larger, more established runner pool than the newly added macOS 26 pool.
+    runs-on: macos-15
     timeout-minutes: 120
     env:
       ENGINE_REPO: ${{ inputs.engine_repository || 'KlugKlugTG/qemu-ios' }}
@@ -199,8 +200,9 @@ jobs:
           git -C qemu-ios apply "$GITHUB_WORKSPACE"/ci/engine-patches/*.patch
           git -C qemu-ios status --short | head -30
 
-      - name: Install ldid
+      - name: Select the preinstalled Xcode toolchain and install ldid
         run: |
+          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
           if ! command -v ldid >/dev/null; then brew install ldid; fi
           xcode-select -p
           xcrun --find clang
