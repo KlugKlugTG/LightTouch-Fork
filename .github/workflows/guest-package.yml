@@ -1,9 +1,14 @@
 name: Build iOS guest packages
 
 # This workflow builds only armv6.itpack and armv7.itpack. It does not build the Android APK or QEMU.
-# Run it manually when the guest-side binaries change; the normal Android APK workflow stays Linux-only.
+# It runs for the guest GLES patch (or manually); the normal Android APK workflow stays Linux-only.
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/guest-package.yml
+      - ci/engine-patches/0011-engine-gles-map-buffer.patch
   workflow_dispatch:
     inputs:
       engine_repository:
@@ -23,8 +28,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  confirm:
+    name: Confirm the guest-package build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    environment: perf-apk
+    steps:
+      - env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "Approve to build the guest packages for PR #${{ github.event.pull_request.number }}: $PR_TITLE"
+
   guest-package:
     name: Build guest itpacks only
+    needs: confirm
+    if: always() && needs.confirm.result != 'failure' && needs.confirm.result != 'cancelled'
     runs-on: macos-15
     timeout-minutes: 120
     env:
