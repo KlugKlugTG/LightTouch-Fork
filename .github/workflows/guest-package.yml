@@ -43,7 +43,7 @@ jobs:
     name: Build guest itpacks only
     needs: confirm
     if: always() && needs.confirm.result != 'failure' && needs.confirm.result != 'cancelled'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       ENGINE_REPO: ${{ inputs.engine_repository }}
