@@ -379,7 +379,27 @@ jobs:
             --name Un1box-guest-packages-37 --dir "$PACKAGE_DIR"
           test -s "$PACKAGE_DIR/armv6.itpack"
           test -s "$PACKAGE_DIR/armv7.itpack"
-          (cd "$PACKAGE_DIR" && sha256sum -c SHA256SUMS)
+          python3 - "$PACKAGE_DIR" <<'PY'
+          import hashlib, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          expected = {}
+          for line in (root / 'SHA256SUMS').read_text().splitlines():
+              fields = line.split(None, 1)
+              if len(fields) != 2:
+                  raise SystemExit(f'invalid SHA256SUMS entry: {line!r}')
+              name = pathlib.Path(fields[1].strip().lstrip('*')).name
+              if name in expected:
+                  raise SystemExit(f'duplicate checksum for {name}')
+              expected[name] = fields[0].lower()
+          for name in ('armv6.itpack', 'armv7.itpack'):
+              path = root / name
+              if not path.is_file():
+                  raise SystemExit(f'missing guest package: {path}')
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              if expected.get(name) != actual:
+                  raise SystemExit(f'{name}: checksum mismatch (manifest={expected.get(name)}, actual={actual})')
+              print(f'{name}: SHA-256 verified')
+          PY
           install -m 0644 "$PACKAGE_DIR/armv6.itpack" ci/guest-tools/armv6.itpack
           install -m 0644 "$PACKAGE_DIR/armv7.itpack" ci/guest-tools/armv7.itpack
           echo "GUEST_PACKAGE_RUN_ID=$SELECTED_RUN" >> "$GITHUB_ENV"
