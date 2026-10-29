@@ -326,8 +326,13 @@ iPad, the iPod touch 1G and the original iPhone (never booted off the Mac), iOS 
   `dataSync` foreground service after six hours a day.
 - [x] Store overlay lacks `testTagsAsResourceId`, so UI automation cannot find its controls.
 - [ ] Some catalog apps marked compatible need iOS 4 APIs (Doodle Jump 3.x: GCD; the n72 search row
-  is 3.6.1). Consider flagging apps that weak-link iOS 4 symbols, or surfacing Last crash
-  automatically after a quick quit. Linux/Windows Apps now has a version picker; it has no Last crash.
+  is 3.6.1). Consider flagging apps that weak-link iOS 4 symbols, or surfacing the crash answer
+  automatically after a quick quit.
+- [ ] The Store's "Why did it quit?" now shows the faulting thread's frames (it filtered them out
+  before, so every crash looked like the same `EXC_BAD_ACCESS at 0x0`), names the binary the crash
+  is in and whether that it is the app or a system library, with the engine and guest-serial log
+  tails. "Record the next launch (30 s)" captures the guest's syslog relay while the app starts,
+  which the crash report cannot replay. The relay itself has never been exercised on a device.
 
 - [x] Battle Bears: Zombies! was guest-CPU-bound (desktop ~24 fps, Pixel 22): its OpenFeint 2.9.1 `_mainDefault:`
   thread spins on an empty run loop. Guest tools serial 31 make that wait sleep (gles-public); 29.6–29.7 fps, the
