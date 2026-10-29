@@ -31,7 +31,7 @@ index 32a6323..fbda499 100644
 +++ b/contrib/guest-package/VERSION
 @@ -1,2 +1,2 @@
 -serial 36
-+serial 38
++serial 39
  version 1.1.34
 diff --git a/contrib/it-gles/mbxshim.c b/contrib/it-gles/mbxshim.c
 index 45e40d3..7f12831 100644
@@ -75,7 +75,7 @@ index 45e40d3..7f12831 100644
  static int s_scalex(void *gc, unsigned x, unsigned y, unsigned z)
      { return (int)qc(796, gc, 3, A(x, y, z)); }
  
-@@ -723,12 +738,139 @@ static int s_compressedTexSubImage2D(void *gc, unsigned target, unsigned level,
+@@ -723,12 +738,121 @@ static int s_compressedTexSubImage2D(void *gc, unsigned target, unsigned level,
                       A(target, level, xoff, yoff, wd_, ht, fmt, imgsz, data)); }
  static int s_genBuffers(void *gc, unsigned n, unsigned ids)
      { return (int)qc(644, gc, 2, A(n, ids)); }
@@ -145,15 +145,6 @@ index 45e40d3..7f12831 100644
 +                                   context->array_buffer) : 0;
 +        GuestMapStorage *storage = 0;
 +
-+        /* These probes distinguish a missing wrapper, a lost binding, and a
-+         * failed lazy reallocation in the guest serial log. Only NULL-backed
-+         * calls are logged, so normal buffer uploads stay quiet. */
-+        if (!data) {
-+            w("[mbxshim] glBufferData(NULL) target="); wx(target);
-+            w(" name="); wd(name); w(" size="); wd(size);
-+            w(" owner="); wx((unsigned long)owner); w("\n");
-+        }
-+
 +        /* Keep only metadata for NULL stores: most are never mapped, so do not
 +         * allocate guest memory until the app actually asks glMapBuffer for it. */
 +        if (!data && size && size <= GLES_MAP_BUFFER_MAX_BYTES && name && owner) {
@@ -185,11 +176,6 @@ index 45e40d3..7f12831 100644
 +                                   context->array_buffer) : 0;
 +        GuestMapStorage *storage = map_storage_find(owner, name);
 +
-+        w("[mbxshim] glMapBuffer target="); wx(target);
-+        w(" name="); wd(name);
-+        w(" storage="); w(storage ? "hit" : "miss");
-+        w(" owner="); wx((unsigned long)owner); w("\n");
-+
 +        if (storage && !storage->data) {
 +            storage->data = calloc(1, storage->size);
 +            if (!storage->data) {
@@ -200,17 +186,13 @@ index 45e40d3..7f12831 100644
 +            guest_fault_read(guest, storage->size);
 +            /* Replace the host's NULL store with this guest-owned storage so
 +             * the host can return its address from the following map call. */
-+            long long upload = qc(646, gc, 4, A(target, storage->size, guest, storage->usage));
-+            w("[mbxshim] lazy backing guest="); wx(guest);
-+            w(" size="); wd(storage->size); w(" glBufferData rc="); wx((unsigned long)upload); w("\n");
-+            if (upload < 0) {
++            if (qc(646, gc, 4, A(target, storage->size, guest, storage->usage)) < 0) {
 +                free(storage->data);
 +                storage->data = 0;
 +                return 0;
 +            }
 +        }
 +        long long mapped = qc(649, gc, 2, A(target, access));
-+        w("[mbxshim] glMapBuffer result="); wx((unsigned long)mapped); w("\n");
 +        return mapped > 0 ? (void *)(unsigned long)mapped : 0;
 +    }
 +static int s_unmapBuffer(void *gc, unsigned target)
@@ -281,9 +263,9 @@ index a9204b3..0fa0b71 100644
  /* A guest buffer big enough to matter is a few MB of geometry; anything past
   * this is a corrupt size, and g_malloc aborts QEMU rather than failing. */
  #define GLES_MAX_BUFFER_BYTES ((size_t)64 * 1024 * 1024)
-+/* OES_mapbuffer access modes. */
-+#define GLES_MAP_READ_ONLY  0x88B9
-+#define GLES_MAP_WRITE_ONLY 0x88BB
++/* OES_mapbuffer access values: WRITE_ONLY_OES is 0x88B9. */
++#define GLES_MAP_READ_ONLY  0x88B8
++#define GLES_MAP_WRITE_ONLY 0x88B9
 +#define GLES_MAP_READ_WRITE 0x88BA
  
  static void gles_buffer_destroy(gpointer p)

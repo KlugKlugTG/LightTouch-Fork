@@ -96,7 +96,7 @@ jobs:
           xcrun ld -v
           if ! command -v ldid >/dev/null; then brew install ldid; fi
 
-      - name: Build guest packages serial 38
+      - name: Build guest packages serial 39
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/guest-package"
@@ -117,7 +117,7 @@ jobs:
             echo '::error::guest package build emitted warnings; refusing to upload partial packages'
             exit 1
           fi
-          grep -E 'armv6 serial 38|armv7 serial 38|serial 38' "$RUNNER_TEMP/guest-package.log" || true
+          grep -E 'armv6 serial 39|armv7 serial 39|serial 39' "$RUNNER_TEMP/guest-package.log" || true
           test -s "$OUT/armv6.itpack"
           test -s "$OUT/armv7.itpack"
           shasum -a 256 "$OUT/armv6.itpack" "$OUT/armv7.itpack" | tee "$OUT/SHA256SUMS"
@@ -125,7 +125,7 @@ jobs:
       - name: Upload only the guest packages
         uses: actions/upload-artifact@v4
         with:
-          name: Un1box-guest-packages-38
+          name: Un1box-guest-packages-39
           path: |
             ${{ runner.temp }}/guest-package/armv6.itpack
             ${{ runner.temp }}/guest-package/armv7.itpack
