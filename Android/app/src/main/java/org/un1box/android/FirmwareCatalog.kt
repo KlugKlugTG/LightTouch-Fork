@@ -18,10 +18,14 @@ internal data class CatalogFirmware(
     val released: String, val prerelease: String, val sha1: String, val bytes: Long, val urls: List<String>,
     /** The catalog's own label: available, experimental or untested (upstream's checks, not Un1box's). */
     val status: String = "",
+    /** Sibling firmware id (`recipe.keybag_ramdisk_from`) whose restore ramdisk boots the keybag one-shot. */
+    val keybagRamdiskFrom: String = "",
 ) {
     /** "3.1.3", or "4.2 beta 2" for a developer build. */
     val label get() = if (prerelease.isEmpty()) version else "$version $prerelease"
     val fileName get() = "${productType}_${version}_${build}_Restore.ipsw"
+    /** K48 iOS 4+ prepares the real iBoot chain and requires `libiboot32patcher.so` beside `libfirmwarekit.so`. */
+    val needsIBootPatcher get() = board == "k48ap" && (version.substringBefore('.').toIntOrNull() ?: 0) >= 4
     val support get() = when {
         id in slowFirmwares -> Support.TESTED_SLOW
         id in testedFirmwares -> Support.TESTED
@@ -69,8 +73,9 @@ internal object FirmwareCatalog {
                 listOf(s.optString("url")) + (s.optJSONArray("mirrors")?.let { m -> (0 until m.length()).map { m.getJSONObject(it).optString("url") } } ?: emptyList())
             }?.filter { it.startsWith("https://") } ?: emptyList()
             val prerelease = e.optString("prerelease").let { kind -> if (kind.isEmpty()) "" else "$kind ${e.optInt("prerelease_number", 0).takeIf { it > 0 } ?: ""}".trim() }
+            val keybagFrom = e.optJSONObject("recipe")?.optString("keybag_ramdisk_from")?.takeIf { it != "null" } ?: ""
             CatalogFirmware(e.getString("id"), e.getString("board"), e.getString("product_type"), e.getString("version"), e.getString("build"),
-                e.optString("released"), prerelease, source?.optString("sha1") ?: "", source?.optLong("bytes") ?: 0L, urls, e.optString("status"))
+                e.optString("released"), prerelease, source?.optString("sha1") ?: "", source?.optLong("bytes") ?: 0L, urls, e.optString("status"), keybagFrom)
         }
     }
 }

@@ -609,7 +609,7 @@ jobs:
           swift build -c release --product firmwarekit --swift-sdk "$LT_SWIFT_ANDROID_SDK" --swift-sdks-path "$SDK_ROOT" \
             --scratch-path .build-android --static-swift-stdlib \
             --pkg-config-path build-support/android-pkgconfig \
-            -Xlinker -lssl -Xlinker -lcrypto >/tmp/firmwarekit.log 2>&1 || report /tmp/firmwarekit.log
+            -Xlinker -lssl -Xlinker -lcrypto -Xlinker -z -Xlinker max-page-size=16384 >/tmp/firmwarekit.log 2>&1 || report /tmp/firmwarekit.log
           echo "c++ runtime the link named: $(grep -o -- '-lc\+\+[a-z_]*' /tmp/firmwarekit.log | sort -u | tr '\n' ' ')" >> /tmp/linknote.txt
           echo "c++ libs the link named: $(grep -o -- '-lc++[a-z_]*' /tmp/firmwarekit.log | sort -u | tr '\n' ' ')" \
             >> /tmp/linknote.txt
@@ -622,11 +622,22 @@ jobs:
           cp "$PRODUCT" "$OUT/firmwarekit"
           "$TOOLS/llvm-strip" "$OUT/firmwarekit"
           # The one-shot the preparation boots through (Portable/oneshot), as build.sh builds it.
-          "$TOOLS/aarch64-linux-android29-clang" -O2 -Wall -Wextra -Werror -o "$OUT/lighttouch-oneshot" \
+          "$TOOLS/aarch64-linux-android29-clang" -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 \
+            -o "$OUT/lighttouch-oneshot" \
             "$GITHUB_WORKSPACE/Portable/oneshot/lighttouch-oneshot.c" >>/tmp/firmwarekit.log 2>&1 \
+            || report /tmp/firmwarekit.log
+          IBOOT_LICENSE="$RUNNER_TEMP/iBoot32Patcher-LICENSE"
+          python3 "$GITHUB_WORKSPACE/scripts/build-iboot32patcher.py" \
+            --cc "$TOOLS/aarch64-linux-android29-clang" \
+            --strip "$TOOLS/llvm-strip" \
+            --android \
+            --cache-dir "$RUNNER_TEMP/iboot32patcher-cache" \
+            --output "$OUT/iBoot32Patcher" \
+            --license-output "$IBOOT_LICENSE" >>/tmp/firmwarekit.log 2>&1 \
             || report /tmp/firmwarekit.log
           python3 build-support/stage-notices.py "$OUT/licenses" --checkouts .build-android/checkouts \
             --swift-license "$BUNDLE/swift-android/swift-resources/usr/share/swift/LICENSE.txt" \
+            --iboot32patcher-license "$IBOOT_LICENSE" \
             --source-reference "https://github.com/$GITHUB_REPOSITORY/tree/$SOURCE_REF" >>/tmp/firmwarekit.log 2>&1 \
             || report /tmp/firmwarekit.log
           echo "--- binary needs ---" >> /tmp/linknote.txt

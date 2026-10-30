@@ -190,6 +190,28 @@ int main(int argc, char **argv) {
     verify_rotation(90, false);
     lt_desktop_window_paused(&window, 0);
 
+    // Landscape-scanned panels (e.g. K48 iPad 1024x768: width > height) present upright (+90 CW)
+    // when display_rotation == 0, and map contacts back to panel coordinates.
+    while (window.display_rotation != 0) {
+        key(SDLK_r, true); key(SDLK_r, false); take();
+    }
+    assert(lt_desktop_window_frame(&window, bgra.data(), 3, 2, 12) == 0);
+    assert(lt_desktop_window_present(&window, 0, 0) == 0);
+    assert(SDL_RenderReadPixels(window.renderer, nullptr, SDL_PIXELFORMAT_RGBA32, pixels.data(), 480 * 4) == 0);
+    const auto ipad_view = window.layout().guest(3, 2, 90);
+    for (int i = 0; i < 6; ++i) {
+        const double gx = (i % 3 + .5) / 3, gy = (i / 3 + .5) / 2;
+        const double u = 1 - gy, v = gx;
+        const double px = ipad_view.left + u * ipad_view.width, py = ipad_view.top + v * ipad_view.height;
+        const auto *pixel = pixels.data() + (int(py) * 480 + int(px)) * 4;
+        assert(pixel[0] == colors[i][0] && pixel[1] == colors[i][1] && pixel[2] == colors[i][2] && pixel[3] == 255);
+        window.pointer({1, 702}, 0, px, py);
+        window.pointer({1, 702}, 2, px, py);
+        const auto contacts = take();
+        assert(contacts.size() == 2 && contacts[0].phase == 0 && contacts[1].phase == 2);
+        assert(std::abs(contacts[0].x - gx) < 1e-8 && std::abs(contacts[0].y - gy) < 1e-8);
+    }
+
     key(SDLK_ESCAPE, true); key(SDLK_ESCAPE, false);
     events = take(); assert(events.size() == 1 && events[0].kind == LT_DESKTOP_STOP);
     assert(!window.enabled && window.stopping);

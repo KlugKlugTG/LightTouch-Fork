@@ -1092,6 +1092,9 @@ static int frontend(const Options &o, int argc, char **argv) {
     auto &contacts = ownership.contacts;
     auto &fingers = ownership.fingers;
     uint32_t next_finger = 10000, display_rotation = 0;
+    auto effective_rotation = [&](uint32_t w, uint32_t h) -> uint32_t {
+        return (display_rotation + (w > h ? 90u : 0u)) % 360u;
+    };
     auto script = script_file(o.script);
     size_t next_script = 0;
     lt::ControlDelivery delivery;
@@ -1432,14 +1435,15 @@ static int frontend(const Options &o, int argc, char **argv) {
             require(SDL_RenderSetScale(renderer, float(width) / logical_width, float(height) / logical_height) == 0,
                     std::string("SDL renderer scale: ") + SDL_GetError());
             const lt::ControlBarLayout layout{logical_width, logical_height};
-            const auto viewport = layout.guest(frame.width, frame.height, display_rotation);
+            const uint32_t render_rotation = effective_rotation(frame.width, frame.height);
+            const auto viewport = layout.guest(frame.width, frame.height, render_rotation);
             SDL_Rect dest{int((logical_width - frame.width * viewport.scale) / 2),
                           int((layout.top() - frame.height * viewport.scale) / 2),
                           int(frame.width * viewport.scale), int(frame.height * viewport.scale)};
             require(SDL_SetRenderDrawColor(renderer, 24, 24, 24, 255) == 0,
                     std::string("SDL clear color: ") + SDL_GetError());
             require(SDL_RenderClear(renderer) == 0, std::string("SDL clear: ") + SDL_GetError());
-            require(!texture || SDL_RenderCopyEx(renderer, texture, nullptr, &dest, display_rotation, nullptr, SDL_FLIP_NONE) == 0,
+            require(!texture || SDL_RenderCopyEx(renderer, texture, nullptr, &dest, render_rotation, nullptr, SDL_FLIP_NONE) == 0,
                     std::string("SDL rotated frame: ") + SDL_GetError());
             lt::draw_control_bar(renderer, layout, controls, paused, stopping);
             SDL_RenderPresent(renderer);
@@ -1450,11 +1454,12 @@ static int frontend(const Options &o, int argc, char **argv) {
             if (window) {
                 int w = 0, h = 0;
                 SDL_GetWindowSize(window, &w, &h);
-                const std::array<int, 5> geometry{w, h, int(frame.width), int(frame.height), int(display_rotation)};
+                const int active_rotation = int(effective_rotation(frame.width, frame.height));
+                const std::array<int, 5> geometry{w, h, int(frame.width), int(frame.height), active_rotation};
                 if (geometry != controls_viewport && controls.any())
                     cancel_controls();
                 controls_viewport = geometry;
-                ownership.resized(w, h, int(frame.width), int(frame.height), int(display_rotation), [&] {
+                ownership.resized(w, h, int(frame.width), int(frame.height), active_rotation, [&] {
                     Packet p;
                     p.kind = Cancel;
                     submit(p);
@@ -1582,10 +1587,11 @@ static int frontend(const Options &o, int argc, char **argv) {
                        (event.type == SDL_FINGERDOWN || event.type == SDL_FINGERMOTION || event.type == SDL_FINGERUP)) {
                 int width = 0, height = 0;
                 SDL_GetWindowSize(window, &width, &height);
-                const auto viewport = lt::ControlBarLayout{width, height}.guest(frame.width, frame.height, display_rotation);
+                const uint32_t touch_rotation = effective_rotation(frame.width, frame.height);
+                const auto viewport = lt::ControlBarLayout{width, height}.guest(frame.width, frame.height, touch_rotation);
                 double x = 0, y = 0;
                 lt_status mapped = lt_map_contact(event.tfinger.x * width, event.tfinger.y * height,
-                    viewport.left, viewport.top, viewport.width, viewport.height, display_rotation, &x, &y);
+                    viewport.left, viewport.top, viewport.width, viewport.height, touch_rotation, &x, &y);
                 if (mapped != LT_OK && fingers.count(event.tfinger.fingerId)) {
                     ownership.outside(false, [&] {
                         Packet p;
@@ -1618,12 +1624,13 @@ static int frontend(const Options &o, int argc, char **argv) {
                     continue;
                 int width = 0, height = 0;
                 SDL_GetWindowSize(window, &width, &height);
-                const auto viewport = lt::ControlBarLayout{width, height}.guest(frame.width, frame.height, display_rotation);
+                const uint32_t mouse_rotation = effective_rotation(frame.width, frame.height);
+                const auto viewport = lt::ControlBarLayout{width, height}.guest(frame.width, frame.height, mouse_rotation);
                 double x = 0, y = 0;
                 int px = event.type == SDL_MOUSEMOTION ? event.motion.x : event.button.x,
                     py = event.type == SDL_MOUSEMOTION ? event.motion.y : event.button.y;
                 lt_status mapped = lt_map_contact(px, py, viewport.left, viewport.top,
-                    viewport.width, viewport.height, display_rotation, &x, &y);
+                    viewport.width, viewport.height, mouse_rotation, &x, &y);
                 if ((contacts.count(1) || contacts.count(2)) && ownership.outside(mapped == LT_OK, [&] {
                         Packet p;
                         p.kind = Cancel;

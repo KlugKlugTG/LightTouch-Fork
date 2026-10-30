@@ -30,11 +30,17 @@ class FirmwareService : Service() {
     @Volatile private var process: java.lang.Process? = null
 
     private val binder = object : IFirmware.Stub() {
-        override fun supports(firmwareId: String): Boolean =
-            File(applicationInfo.nativeLibraryDir, "libfirmwarekit.so").canExecute() &&
-                FirmwareCatalog.load(this@FirmwareService).any { it.id == firmwareId }
+        override fun supports(firmwareId: String): Boolean {
+            val libs = File(applicationInfo.nativeLibraryDir)
+            if (!File(libs, "libfirmwarekit.so").canExecute() || !File(libs, "liblighttouch_oneshot.so").canExecute()) return false
+            val entry = FirmwareCatalog.load(this@FirmwareService).firstOrNull { it.id == firmwareId } ?: return false
+            return !entry.needsIBootPatcher || File(libs, "libiboot32patcher.so").canExecute()
+        }
         override fun start(
             firmwareId: String, ipswPath: String, trustedToolsRoot: String, bootromPath: String, jailbreak: Boolean
+        ): Bundle = startWithSibling(firmwareId, ipswPath, "", trustedToolsRoot, bootromPath, jailbreak)
+        override fun startWithSibling(
+            firmwareId: String, ipswPath: String, siblingIpswPath: String, trustedToolsRoot: String, bootromPath: String, jailbreak: Boolean
         ): Bundle {
             check(consumed.compareAndSet(false, true)) { "A fresh firmware worker is required" }
             foreground()
@@ -44,7 +50,7 @@ class FirmwareService : Service() {
             val job = java.lang.Long.toHexString(SystemClock.uptimeMillis())
             destination = File(parent, "job-$job").absolutePath
             note("preparing")
-            Thread({ prepare(firmwareId, ipswPath, File(trustedToolsRoot), bootromPath, jailbreak) }, "firmwarekit").start()
+            Thread({ prepare(firmwareId, ipswPath, siblingIpswPath, File(trustedToolsRoot), bootromPath, jailbreak) }, "firmwarekit").start()
             return status()
         }
         override fun status(): Bundle = Bundle().apply {
@@ -78,7 +84,7 @@ class FirmwareService : Service() {
      * (adoptPrepared: no pack-base, no copy, no second hash). The IPSW is only read. With `jailbreak`, the Cydia
      * bootstrap the activity downloaded (CydiaBootstrap.directory) is read from beside the cache and installed.
      */
-    private fun prepare(firmwareId: String, ipsw: String, tools: File, bootrom: String, jailbreak: Boolean) {
+    private fun prepare(firmwareId: String, ipsw: String, siblingIpsw: String, tools: File, bootrom: String, jailbreak: Boolean) {
         // Preparation boots iOS (the keybag, the first start) against timeouts: the CPU stays awake while the phone
         // locks or the user switches away. The foreground service only keeps the process alive, not the CPU running.
         val awake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Un1box:preparation")
@@ -103,6 +109,7 @@ class FirmwareService : Service() {
                 "--language", Locale.getDefault().toLanguageTag(),
                 // iOS 5 and later start at the Home screen, not Setup Assistant (ignored before 5, which has none)
                 "--skip-setup") +
+                (if (siblingIpsw.isNotEmpty()) listOf("--sibling-ipsw", siblingIpsw) else emptyList()) +
                 // Cydia, Substrate and afc2 in the system volume, from the bootstrap the activity put in the cache
                 (if (jailbreak) listOf("--jailbreak") else emptyList()) +
                 // the iPod touch 2G's keybag boot (iOS 4) runs its SecureROM, which no IPSW carries
@@ -191,6 +198,7 @@ class FirmwareService : Service() {
             .redirectError(File(cacheDir, "firmwarekit.log").apply { parentFile?.mkdirs() })
         builder.environment().apply {
             put("LTM_QEMU_DYLIB", File(libs, "libqemu-arm.so").path)
+            File(libs, "libiboot32patcher.so").takeIf { it.canExecute() }?.let { put("FIRMWAREKIT_IBOOT_PATCHER", it.path) }
             put("LD_LIBRARY_PATH", libs.path)
             put("HOME", filesDir.path); put("TMPDIR", cacheDir.path)
             // A signal death (exit 139 is SIGSEGV) leaves no message of its own; the Swift runtime
