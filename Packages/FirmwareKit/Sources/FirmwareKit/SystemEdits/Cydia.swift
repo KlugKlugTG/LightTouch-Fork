@@ -165,17 +165,15 @@ extension SystemEdits {
         var entries: [String] = []
         var special: [(path: String, mode: UInt16)] = []
         for p in packages {
-            entries += try tar(["-tf", p.path]).split(separator: "\n").map(Self.entryPath).filter {
+            entries += try TarExtract.paths(p).filter {
                 $0 != Cydia.excluded && !$0.hasPrefix(Cydia.excluded + "/")
             }
-            for line in try tar(["-tvf", p.path]).split(separator: "\n") {
-                if let entry = Self.specialMode(String(line)) { special.append(entry) }
-            }
+            special += try TarExtract.specialModes(p)
         }
         entries = entries.filter { !$0.isEmpty }
         let added = Set(entries.filter { !exists($0) })
         for p in packages {
-            _ = try tar(["-xkf", p.path, "-C", m.path, "--exclude", "./" + Cydia.excluded, "--exclude", Cydia.excluded])
+            try TarExtract.extract(p, into: m, excluding: [Cydia.excluded])
         }
         guard exists("Applications/Cydia.app/Cydia") else {
             throw FirmwareError(.internal, "Cydia bootstrap: no Applications/Cydia.app/Cydia after extracting")
@@ -247,24 +245,5 @@ extension SystemEdits {
         if p[5] == "s" || p[5] == "S" { mode |= 0o2000 }
         guard mode & 0o6000 != 0 else { return nil }
         return (entryPath(fields[8]), mode)
-    }
-
-    /// /usr/bin/tar `args`; its stdout, or an error with its stderr.
-    private static func tar(_ args: [String]) throws -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        p.arguments = args
-        let out = Pipe()
-        let err = Pipe()
-        p.standardOutput = out
-        p.standardError = err
-        try p.run()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        let errors = err.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            throw FirmwareError(.internal, "tar \(args.first ?? ""): \(String(decoding: errors, as: UTF8.self))")
-        }
-        return String(decoding: data, as: UTF8.self)
     }
 }
