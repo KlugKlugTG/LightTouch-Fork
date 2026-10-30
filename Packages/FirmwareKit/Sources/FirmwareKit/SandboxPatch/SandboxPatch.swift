@@ -45,7 +45,10 @@ public enum SandboxPatch {
     /// Locate sb_evaluate in a decrypted, decompressed kernelcache Mach-O. Throws when the kernel has no Seatbelt
     /// kext (iOS before the prelinked sandbox) or the pattern does not resolve.
     public static func locate(_ kernel: [UInt8]) throws -> Found {
-        let img = try Image(kernel)
+        try locate(Image(kernel))
+    }
+
+    static func locate(_ img: Image) throws -> Found {
         guard let klo = img.sandboxKextLoadAddr() else { throw Error.noSandboxKext }
         guard let (taddr, tsize) = img.kextText(klo) else { throw Error.noKextText }
         guard let so = img.findCString("bad opcode"), let saddr = img.offToAddr(so) else { throw Error.noString }
@@ -94,7 +97,7 @@ public enum SandboxPatch {
         guard let x = refs.min() else { throw Error.noReference }
         guard let entry = prologues.filter({ $0 <= x }).max() else { throw Error.noPrologue }
         guard let eo = img.addrToOff(entry) else { throw Error.noPrologue }
-        let orig = Array(kernel[eo..<eo + 4])
+        let orig = Array(img.bytes[eo..<eo + 4])
         // A real prologue: push {..,lr} (0xB5xx) or push.w {..,lr} (0xE92D, lr bit set).
         let hw = UInt16(orig[0]) | UInt16(orig[1]) << 8
         let isPush16 = hw & 0xFE00 == 0xB400 && hw & 0x0100 != 0
@@ -105,11 +108,23 @@ public enum SandboxPatch {
 
     /// Apply the patch in place, returning the patched kernelcache and where it landed.
     public static func apply(_ kernel: [UInt8]) throws -> (kernel: [UInt8], found: Found) {
-        let found = try locate(kernel)
+        let img = try Image(kernel)
+        let found = try locate(img)
         var out = kernel
-        guard let o = try Image(kernel).addrToOff(found.address) else { throw Error.badPatchSite }
+        guard let o = img.addrToOff(found.address) else { throw Error.badPatchSite }
         out.replaceSubrange(o..<o + patch.count, with: patch)
         return (out, found)
+    }
+
+    /// Apply the patch in place inside a flat-mapped KBoot image (`0..<imageBytes` of `kboot.bin`, where segments sit
+    /// at `vmaddr - vbase`).
+    public static func applyLoaded(_ kboot: inout [UInt8], imageBytes: Int) throws -> Found {
+        guard imageBytes > 0, imageBytes <= kboot.count else { throw Error.notMachO }
+        let img = try Image(loaded: Array(kboot[0..<imageBytes]))
+        let found = try locate(img)
+        guard let o = img.addrToOff(found.address), o + patch.count <= imageBytes else { throw Error.badPatchSite }
+        kboot.replaceSubrange(o..<o + patch.count, with: patch)
+        return found
     }
 
     // MARK: - The real-iBoot kernelcache (k48)
@@ -238,6 +253,57 @@ struct Image {
         }
         segs = sg
         sects = sc
+    }
+
+    /// View a flat-loaded KBoot image (`KBoot.build`), where Mach-O segments sit at `vmaddr - vbase` and the `__TEXT`
+    /// header lands on a 4 KiB page near the start of the image.
+    init(loaded b: [UInt8]) throws {
+        var headerOff: Int?
+        var off = 0
+        while off + 28 <= b.count, off < 0x10000 {
+            if le32(b, off) == 0xFEED_FACE, le32(b, off + 4) == 12 {
+                headerOff = off
+                break
+            }
+            off += 0x1000
+        }
+        guard let hdr = headerOff else { throw SandboxPatch.Error.notMachO }
+        bytes = b
+        var rawSegs: [(String, UInt32, UInt32, UInt32)] = []
+        var rawSects: [(String, String, UInt32, UInt32)] = []
+        var pos = hdr + 28
+        for _ in 0..<le32(b, hdr + 16) {
+            guard pos + 8 <= b.count else { break }
+            let cmd = le32(b, pos), size = Int(le32(b, pos + 4))
+            guard size >= 8, pos + size <= b.count else { break }
+            if cmd == 1 {
+                let segName = Image.cstr(b, pos + 8, 16)
+                rawSegs.append((segName, le32(b, pos + 24), le32(b, pos + 28), le32(b, pos + 36)))
+                let nsects = Int(le32(b, pos + 48))
+                var so = pos + 56
+                for _ in 0..<nsects where so + 68 <= pos + size {
+                    rawSects.append(
+                        (Image.cstr(b, so, 16), Image.cstr(b, so + 16, 16), le32(b, so + 32), le32(b, so + 36))
+                    )
+                    so += 68
+                }
+            }
+            pos += size
+        }
+        let nonZero = rawSegs.filter { $0.0 != "__PAGEZERO" }
+        guard let lowest = nonZero.map(\.1).min() else { throw SandboxPatch.Error.notMachO }
+        let vbase = lowest & 0xF000_0000
+        segs = nonZero.compactMap { (_, vmaddr, vmsize, filesize) in
+            guard vmaddr >= vbase else { return nil }
+            let fileoff = vmaddr &- vbase
+            let mapped = min(filesize, vmsize)
+            guard Int(fileoff) + Int(mapped) <= b.count else { return nil }
+            return (vmaddr, vmsize, fileoff, mapped)
+        }
+        sects = rawSects.compactMap { (sect, seg, addr, size) in
+            guard addr >= vbase else { return nil }
+            return (sect, seg, addr, size, addr &- vbase)
+        }
     }
 
     static func cstr(_ b: [UInt8], _ o: Int, _ n: Int) -> String {

@@ -288,7 +288,8 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         refreshDevices()
     }
     private fun workerExitedRun() = Bundle().apply { putString("state", "failed"); putString("error", "The preparation worker stopped unexpectedly. Try again.") }
-    private val stockIpsw = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) importStockIpsw(uri) }
+    private val stockIpsw = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) importStockIpsw(uri, sibling = false) }
+    private val siblingStockIpsw = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) importStockIpsw(uri, sibling = true) }
     private val prepRom = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) importPrepRom(uri) }
     private val preparedCopy = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri -> if (uri != null) addPreparedCopy(uri) }
     private var active = false
@@ -447,6 +448,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         Thread({ WorkerExitEvidence.capture(applicationContext, 0) }, "previous-worker-exit").start()
         val imports = getSharedPreferences("preparation-imports", MODE_PRIVATE)
         imports.getString("ipsw", "")?.takeIf { File(it).isFile }?.let { prep.ipswPath = it; prep.ipswFor = imports.getString("ipswFor", "") ?: "" }
+        imports.getString("siblingIpsw", "")?.takeIf { File(it).isFile }?.let { prep.siblingIpswPath = it; prep.siblingIpswFor = imports.getString("siblingIpswFor", "") ?: "" }
         prep.firmwareId = imports.getString("firmwareId", "") ?: ""
         preparedImported = imports.getString("preparedImported", "") ?: ""
         retainedPreparedOutput = imports.getString("pendingPrepared", "") ?: ""
@@ -458,8 +460,11 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
             try {
                 val catalog = FirmwareCatalog.load(this)
                 firmwareTargets = catalog.associate { "${it.board}-${it.build}" to StoreTarget.of(it.productType, it.version) }
-                // firmwarekit prepares every catalog firmware; an APK built without it only adds copies prepared elsewhere.
-                val supported = if (File(applicationInfo.nativeLibraryDir, "libfirmwarekit.so").canExecute()) catalog.map { it.id }.toSet() else emptySet()
+                // firmwarekit prepares every catalog firmware; K48 iOS 4+ also needs libiboot32patcher.so beside it.
+                val libs = File(applicationInfo.nativeLibraryDir)
+                val hasKit = File(libs, "libfirmwarekit.so").canExecute() && File(libs, "liblighttouch_oneshot.so").canExecute()
+                val hasIBootPatcher = File(libs, "libiboot32patcher.so").canExecute()
+                val supported = if (!hasKit) emptySet() else catalog.filter { !it.needsIBootPatcher || hasIBootPatcher }.map { it.id }.toSet()
                 handler.post { prep.catalog = catalog; prep.supported = supported; catalogVersion++; if (overlay == Screen.STORE) store.useRecord(selectedRecordId(), recordTarget()); if (engine != null) refreshDevices() }
             } catch (_: Exception) { /* The Store falls back to the running guest's own report. */ }
         }, "store-targets").start()
@@ -893,15 +898,20 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
     private fun PrepareOverlay() {
         val board = prep.firmware?.board
         LaunchedEffect(board, records) { board?.let { findBootrom(it) } }
-        // Cydia's bootstrap may already be in the cache (an earlier preparation): check it off the main thread.
-        LaunchedEffect(prep.firmwareId) { if (prep.jailbreak && prep.firmwareId.isNotEmpty()) checkCydiaBootstrap() }
+        // Cydia's bootstrap or downloaded IPSWs may already be on disk: check off the main thread.
+        LaunchedEffect(prep.firmwareId, prep.catalog) {
+            if (prep.firmwareId.isNotEmpty()) findSavedIpsws(prep.firmware, prep.siblingFirmware)
+            if (prep.jailbreak && prep.firmwareId.isNotEmpty()) checkCydiaBootstrap()
+        }
         PrepareScreen(prep, busy, preparationActive(),
             onDownload = ::downloadIpsw, onChooseIpsw = { stockIpsw.launch(arrayOf("application/octet-stream", "*/*")) },
             onChooseRom = { prepRom.launch(arrayOf("application/octet-stream", "*/*")) }, onDownloadRom = ::downloadBootrom, onPrepare = ::beginPreparation,
             onJailbreak = ::chooseJailbreak,
             onChoosePrepared = { preparedCopy.launch(null) },
             onCancel = { firmware?.cancel(); prep.preparation = prep.preparation?.apply { putString("state", "cancelling") } },
-            onRetryImport = { prep.preparation?.let { importPreparedOutput(it) } }, onAdvanced = ::openDeviceFiles, onClose = ::closePreparation)
+            onRetryImport = { prep.preparation?.let { importPreparedOutput(it) } }, onAdvanced = ::openDeviceFiles, onClose = ::closePreparation,
+            onDownloadSibling = ::downloadSiblingIpsw,
+            onChooseSiblingIpsw = { siblingStockIpsw.launch(arrayOf("application/octet-stream", "*/*")) })
     }
     /** The advanced path from the device list: add device files the user already has (the setup wizard's import). */
     private fun openDeviceFiles() {
@@ -942,7 +952,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
     private fun beginPreparation() {
         if (preparationActive() || busy) return
         val chosen = prep.firmware ?: return
-        if (!prep.ipswReady || !prep.romReady) return
+        if (!prep.ipswReady || !prep.siblingReady || !prep.romReady) return
         if (prep.jailbreak && !prep.jailbreakReady) {
             prep.jailbreakError = "Cydia's files are not downloaded yet"
             return
@@ -953,6 +963,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         val spent = try { worker.status().getBoolean("consumed") } catch (_: RemoteException) { true }
         if (spent) { restartFirmwareForPreparation(); return }
         val selectedIpsw = prep.ipswPath
+        val selectedSiblingIpsw = if (prep.siblingFirmware != null) prep.siblingIpswPath else ""
         val selectedRom = if (needsBootrom(chosen.board)) prep.romPath else ""
         // 1.x has no jailbreak (FirmwareKit refuses it); the prepare screen does not offer it there either.
         val jailbreak = prep.jailbreak && CydiaBootstrap.offers(chosen.version)
@@ -966,7 +977,8 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
             try {
                 // firmwarekit bakes the APK's own guest helpers and packages into the system.
                 val tools = GuestTools.firmwareTools(this)
-                val state = worker.start(chosen.id, selectedIpsw, tools.absolutePath, selectedRom, jailbreak)
+                val state = if (selectedSiblingIpsw.isEmpty()) worker.start(chosen.id, selectedIpsw, tools.absolutePath, selectedRom, jailbreak)
+                    else worker.startWithSibling(chosen.id, selectedIpsw, selectedSiblingIpsw, tools.absolutePath, selectedRom, jailbreak)
                 handler.post { prep.preparation = state }
             } catch (e: Exception) { handler.post { prep.preparation = Bundle().apply { putString("state", "failed"); putString("error", e.message ?: "Cannot start preparation"); putBoolean("consumed", true) } } }
         }, "prepare-start").start()
@@ -1019,7 +1031,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         val worker = engine
         val destination = requireNotNull(state.getString("destination")); preparedImported = destination; busy = true; preparedImportInFlight = true
         prep.importPhase = ""; prep.importProgress = -1f
-        val chosen = prep.firmware; val ipsw = prep.ipswPath
+        val chosen = prep.firmware; val ipsw = prep.ipswPath; val siblingIpsw = prep.siblingIpswPath
         // Only the boot ROM this device starts from: one picked for another device stays out of its record.
         val rom = if (prep.bootrom != null && prep.romReady) prep.romPath else ""
         val board = chosen?.board ?: prep.firmwareId.substringBefore('-'); val build = chosen?.build ?: prep.firmwareId.substringAfter('-')
@@ -1046,6 +1058,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
                 File(destination).walkTopDown().forEach { it.setWritable(true, true) }
                 File(destination).deleteRecursively(); File("$destination.native.log").delete()
                 if (ipsw.startsWith(filesDir.absolutePath)) File(ipsw).delete()
+                if (siblingIpsw.startsWith(filesDir.absolutePath) && siblingIpsw != ipsw) File(siblingIpsw).delete()
             }
             handler.post {
                 busy = false; preparedImportInFlight = false; prep.importError = result
@@ -1053,7 +1066,9 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
                     retainedPreparedOutput = ""
                     if (PreparationNote.read(this)?.optString("destination") == destination) PreparationNote.clear(this)
                     if (ipsw.startsWith(filesDir.absolutePath)) prep.ipswPath = ""
-                    getSharedPreferences("preparation-imports", MODE_PRIVATE).edit().putString("preparedImported", destination).remove("pendingPrepared").remove("ipsw").apply()
+                    if (siblingIpsw.startsWith(filesDir.absolutePath)) prep.siblingIpswPath = ""
+                    getSharedPreferences("preparation-imports", MODE_PRIVATE).edit()
+                        .putString("preparedImported", destination).remove("pendingPrepared").remove("ipsw").remove("siblingIpsw").apply()
                     refreshDevices(); releaseFirmware(); preparationOpen = false; prep.preparation = null; prep.step = PrepareStep.DEVICE
                     if (selected) {
                         setup.reset(firstRun = false); setup.created = name; setup.step = SetupStep.DONE; overlay = Screen.SETUP
@@ -1064,43 +1079,90 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
             }
         }, "prepared-device-import").start()
     }
-    private fun rememberIpsw(path: String, firmwareId: String) {
-        prep.ipswPath = path; prep.ipswFor = firmwareId; prep.ipswError = ""
-        getSharedPreferences("preparation-imports", MODE_PRIVATE).edit().putString("ipsw", path).putString("ipswFor", firmwareId).putString("firmwareId", firmwareId).apply()
+    private fun findSavedIpsws(chosen: CatalogFirmware?, sibling: CatalogFirmware?) {
+        val dir = IpswDownload.directory(this)
+        Thread({
+            if (chosen != null && !prep.ipswReady) {
+                val candidate = File(dir, chosen.fileName)
+                if (candidate.isFile && (chosen.bytes <= 0 || candidate.length() == chosen.bytes) && (chosen.sha1.isEmpty() || IpswDownload.sha1(candidate) == chosen.sha1)) {
+                    handler.post { if (prep.firmwareId == chosen.id && !prep.ipswReady) rememberIpsw(candidate.absolutePath, chosen.id, sibling = false) }
+                }
+            }
+            if (sibling != null && !prep.siblingReady) {
+                val candidate = File(dir, sibling.fileName)
+                if (candidate.isFile && (sibling.bytes <= 0 || candidate.length() == sibling.bytes) && (sibling.sha1.isEmpty() || IpswDownload.sha1(candidate) == sibling.sha1)) {
+                    handler.post { if (prep.siblingFirmware?.id == sibling.id && !prep.siblingReady) rememberIpsw(candidate.absolutePath, sibling.id, sibling = true) }
+                }
+            }
+        }, "find-ipsw").start()
+    }
+    private fun rememberIpsw(path: String, firmwareId: String, sibling: Boolean = false) {
+        val editor = getSharedPreferences("preparation-imports", MODE_PRIVATE).edit()
+        if (sibling) {
+            prep.siblingIpswPath = path; prep.siblingIpswFor = firmwareId; prep.siblingIpswError = ""
+            editor.putString("siblingIpsw", path).putString("siblingIpswFor", firmwareId)
+        } else {
+            prep.ipswPath = path; prep.ipswFor = firmwareId; prep.ipswError = ""
+            editor.putString("ipsw", path).putString("ipswFor", firmwareId).putString("firmwareId", firmwareId)
+        }
+        editor.apply()
     }
     private fun downloadIpsw() {
         val chosen = prep.firmware ?: return
         prep.ipswError = ""
-        IpswDownload.start(this, chosen) { file, _ -> handler.post { if (file != null) rememberIpsw(file.absolutePath, chosen.id) } }
+        IpswDownload.start(this, chosen) { file, _ -> handler.post { if (file != null) rememberIpsw(file.absolutePath, chosen.id, sibling = false) } }
     }
-    /** Copies a chosen IPSW in, checking its SHA-1 against the chosen version's on the way. */
-    private fun importStockIpsw(uri: Uri) {
-        val chosen = prep.firmware ?: return
+    private fun downloadSiblingIpsw() {
+        val sibling = prep.siblingFirmware ?: return
+        prep.siblingIpswError = ""
+        IpswDownload.start(this, sibling) { file, _ -> handler.post { if (file != null) rememberIpsw(file.absolutePath, sibling.id, sibling = true) } }
+    }
+    /** Copies a chosen IPSW in, checking its SHA-1 against the expected version's on the way. */
+    private fun importStockIpsw(uri: Uri, sibling: Boolean) {
+        val targetFirmware = (if (sibling) prep.siblingFirmware else prep.firmware) ?: return
         if (preparationActive() || busy) return
-        busy = true; prep.ipswError = ""; prep.ipswChecking = "Copying ${displayName(uri)}"
-        DownloadService.hold(applicationContext, "Copying iOS ${chosen.label}")
+        busy = true
+        if (sibling) { prep.siblingIpswError = ""; prep.siblingIpswChecking = "Copying ${displayName(uri)}" }
+        else { prep.ipswError = ""; prep.ipswChecking = "Copying ${displayName(uri)}" }
+        DownloadService.hold(applicationContext, "Copying iOS ${targetFirmware.label}")
         Thread({
-            val target = File(IpswDownload.directory(this).apply { mkdirs() }, chosen.fileName)
+            val target = File(IpswDownload.directory(this).apply { mkdirs() }, targetFirmware.fileName)
             val partial = File(target.path + ".copy")
             try {
                 val digest = java.security.MessageDigest.getInstance("SHA-1")
                 val total = DocumentFile.fromSingleUri(this, uri)?.length() ?: 0L
-                require(chosen.bytes <= 0 || total <= 0 || total == chosen.bytes) { "That file is not the iOS ${chosen.label} IPSW for the ${shortProductName(chosen.productType)}" }
+                require(targetFirmware.bytes <= 0 || total <= 0 || total == targetFirmware.bytes) {
+                    "That file is not the iOS ${targetFirmware.label} IPSW for the ${shortProductName(targetFirmware.productType)}"
+                }
                 contentResolver.openInputStream(uri)?.use { input -> partial.outputStream().use { output ->
                     val buffer = ByteArray(1 shl 20); var done = 0L
                     while (true) {
                         val n = input.read(buffer); if (n < 0) break
                         output.write(buffer, 0, n); digest.update(buffer, 0, n); done += n
-                        if (total > 0) handler.post { prep.ipswChecking = "Copying and checking… ${done * 100 / total}%" }
+                        if (total > 0) handler.post {
+                            val progressText = "Copying and checking… ${done * 100 / total}%"
+                            if (sibling) prep.siblingIpswChecking = progressText else prep.ipswChecking = progressText
+                        }
                     }
                 } } ?: error("Cannot read the IPSW")
                 val sha1 = digest.digest().joinToString("") { "%02x".format(it) }
-                require(chosen.sha1.isEmpty() || sha1 == chosen.sha1) { "That file is not the iOS ${chosen.label} IPSW for the ${shortProductName(chosen.productType)}" }
+                require(targetFirmware.sha1.isEmpty() || sha1 == targetFirmware.sha1) {
+                    "That file is not the iOS ${targetFirmware.label} IPSW for the ${shortProductName(targetFirmware.productType)}"
+                }
                 check(partial.renameTo(target)) { "Could not save the IPSW" }
-                handler.post { rememberIpsw(target.absolutePath, chosen.id); prep.ipswChecking = ""; busy = false }
+                handler.post {
+                    rememberIpsw(target.absolutePath, targetFirmware.id, sibling = sibling)
+                    if (sibling) prep.siblingIpswChecking = "" else prep.ipswChecking = ""
+                    busy = false
+                }
             } catch (e: Exception) {
                 partial.delete()
-                handler.post { prep.ipswError = e.message ?: "Could not use that IPSW"; prep.ipswChecking = ""; busy = false }
+                handler.post {
+                    val msg = e.message ?: "Could not use that IPSW"
+                    if (sibling) { prep.siblingIpswError = msg; prep.siblingIpswChecking = "" }
+                    else { prep.ipswError = msg; prep.ipswChecking = "" }
+                    busy = false
+                }
             } finally { DownloadService.release(applicationContext) }
         }, "stock-ipsw-import").start()
     }

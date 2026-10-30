@@ -56,14 +56,18 @@ struct LTDesktopWindow {
             emit(LT_DESKTOP_STOP);
         }
     }
+    int effective_rotation() const {
+        return (display_rotation + (guest_width > guest_height ? 90 : 0)) % 360;
+    }
     bool position(double px, double py, double &x, double &y) const {
-        const auto view = layout().guest(guest_width, guest_height, display_rotation);
+        const int rot = effective_rotation();
+        const auto view = layout().guest(guest_width, guest_height, rot);
         if (view.width <= 0 || view.height <= 0 || px < view.left || py < view.top ||
             px >= view.left + view.width || py >= view.top + view.height)
             return false;
         const double u = (px - view.left) / view.width, v = (py - view.top) / view.height;
         // Inverse of SDL's clockwise presentation, in native guest coordinates.
-        switch (display_rotation) {
+        switch (rot) {
         case 90: x = v; y = 1 - u; break;
         case 180: x = 1 - u; y = 1 - v; break;
         case 270: x = 1 - v; y = u; break;
@@ -202,14 +206,15 @@ extern "C" int lt_desktop_window_present(LTDesktopWindow *window, int paused, in
     SDL_SetRenderDrawColor(window->renderer, 12, 14, 18, 255);
     if (SDL_RenderClear(window->renderer) != 0) return -1;
     if (window->texture) {
-        const auto view = layout.guest(window->guest_width, window->guest_height, window->display_rotation);
+        const int rot = window->effective_rotation();
+        const auto view = layout.guest(window->guest_width, window->guest_height, rot);
         // SDL rotates about the destination centre, so this rectangle keeps the
         // unrotated dimensions while the viewport fits their rotated bounds.
         const double width = window->guest_width * view.scale, height = window->guest_height * view.scale;
         const SDL_FRect destination{float((layout.width - width) / 2), float((layout.top() - height) / 2),
                                    float(width), float(height)};
         if (SDL_RenderCopyExF(window->renderer, window->texture, nullptr, &destination,
-                              window->display_rotation, nullptr, SDL_FLIP_NONE) != 0) return -1;
+                              rot, nullptr, SDL_FLIP_NONE) != 0) return -1;
     }
     lt::draw_control_bar(window->renderer, layout, window->controls, paused != 0, stopping != 0);
     SDL_RenderPresent(window->renderer);

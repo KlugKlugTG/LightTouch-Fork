@@ -207,6 +207,8 @@ build_firmwarekit() {
     mkdir -p "$OUT/firmwarekit/linux"
     cp "$REPO/Packages/FirmwareKit/.build/release/firmwarekit" "$OUT/firmwarekit/linux/"
     cc -O2 -Wall -Wextra -Werror -o "$OUT/firmwarekit/linux/lighttouch-oneshot" "$REPO/Portable/oneshot/lighttouch-oneshot.c" -ldl -lpthread
+    python3 "$REPO/scripts/build-iboot32patcher.py" --cc cc --cache-dir "$OUT/cache" \
+        --output "$OUT/firmwarekit/linux/iBoot32Patcher"
     ls -la "$OUT/firmwarekit/linux"
 }
 
@@ -225,12 +227,23 @@ build_firmwarekit_android() {
     mkdir -p "$OUT/firmwarekit/android"
     cp "$REPO/Packages/FirmwareKit/.build-android/out/Products/Release-android-aarch64/firmwarekit" "$OUT/firmwarekit/android/"
     "$NDK_BIN/llvm-strip" "$OUT/firmwarekit/android/firmwarekit"
-    "$NDK_BIN/aarch64-linux-android29-clang" -O2 -Wall -Wextra -Werror -o "$OUT/firmwarekit/android/lighttouch-oneshot" \
+    "$NDK_BIN/aarch64-linux-android29-clang" -O2 -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 \
+        -o "$OUT/firmwarekit/android/lighttouch-oneshot" \
         "$REPO/Portable/oneshot/lighttouch-oneshot.c"
+    local iboot_license="$OUT/firmwarekit/android/.iboot32patcher-LICENSE"
+    python3 "$REPO/scripts/build-iboot32patcher.py" \
+        --cc "$NDK_BIN/aarch64-linux-android29-clang" \
+        --strip "$NDK_BIN/llvm-strip" \
+        --android \
+        --cache-dir "$OUT/cache" \
+        --output "$OUT/firmwarekit/android/iBoot32Patcher" \
+        --license-output "$iboot_license"
     python3 "$REPO/Packages/FirmwareKit/build-support/stage-notices.py" "$OUT/firmwarekit/android/licenses" \
         --checkouts "$REPO/Packages/FirmwareKit/.build-android/checkouts" \
         --swift-license "$LT_SWIFT_ANDROID_BUNDLE/swift-android/swift-resources/usr/share/swift/LICENSE.txt" \
+        --iboot32patcher-license "$iboot_license" \
         --source-reference "${LT_SOURCE_REFERENCE:-https://github.com/blake-lucas/LightTouch/tree/$(git -C "$REPO" branch --show-current)}"
+    rm -f "$iboot_license"
     ls -la "$OUT/firmwarekit/android"
 }
 

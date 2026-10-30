@@ -102,18 +102,19 @@ val sourceRevision = providers.gradleProperty("sourceRevision").orElse(
 val sourceReference = providers.gradleProperty("sourceReference").orElse(
     sourceRevision.map { "https://github.com/KlugKlugTG/Un1box/tree/$it" }
 )
-// firmwarekit, the preparer every port shares (-PfirmwareKitDir: scripts/build.sh firmwarekit-android): it and
-// lighttouch-oneshot ship as executables in nativeLibraryDir, with the notices of what it links.
+// firmwarekit, the preparer every port shares (-PfirmwareKitDir: scripts/build.sh firmwarekit-android): it,
+// lighttouch-oneshot and iBoot32Patcher ship as executables in nativeLibraryDir, with the notices of what they link.
 providers.gradleProperty("firmwareKitDir").orNull?.let { input ->
     val kit = file(input)
-    require(listOf("firmwarekit", "lighttouch-oneshot", "licenses/manifest.json").all { kit.resolve(it).isFile }) {
-        "firmwareKitDir must hold firmwarekit, lighttouch-oneshot and licenses/ (scripts/build.sh firmwarekit-android)"
+    require(listOf("firmwarekit", "lighttouch-oneshot", "iBoot32Patcher", "licenses/manifest.json").all { kit.resolve(it).isFile }) {
+        "firmwareKitDir must hold firmwarekit, lighttouch-oneshot, iBoot32Patcher and licenses/ (scripts/build.sh firmwarekit-android)"
     }
     val firmwareKitJniLibs = layout.buildDirectory.dir("generated/firmwareKitJniLibs")
     val firmwareKitNotices = layout.buildDirectory.dir("generated/firmwareKitNotices")
     val stage = tasks.register<Copy>("prepareFirmwareKit") {
         from(kit) { include("firmwarekit"); rename { "libfirmwarekit.so" } }
         from(kit) { include("lighttouch-oneshot"); rename { "liblighttouch_oneshot.so" } }
+        from(kit) { include("iBoot32Patcher"); rename { "libiboot32patcher.so" } }
         into(firmwareKitJniLibs.map { it.dir("arm64-v8a") })
     }
     val notices = tasks.register<Copy>("prepareFirmwareKitNotices") {

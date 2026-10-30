@@ -35,18 +35,31 @@ It is built with the Swift SDK for Android and links, statically:
 """
 
 
+NOTICE_IBOOT = """
+Beside firmwarekit, the package ships iBoot32Patcher (iBoot32Patcher-LICENSE, GPL-3.0-or-later,
+https://github.com/LukeZGD/iBoot32Patcher), which firmwarekit runs as a separate process when preparing
+the iPad 1st gen (k48ap) iBoot chain.
+"""
+
+
 def main():
     a = argparse.ArgumentParser()
     a.add_argument("out", type=Path)
     a.add_argument("--checkouts", type=Path, required=True)
     a.add_argument("--swift-license", type=Path, required=True)
+    a.add_argument("--iboot32patcher-license", type=Path)
     a.add_argument("--source-reference", required=True)
     args = a.parse_args()
     if args.out.exists():
         shutil.rmtree(args.out)
     args.out.mkdir(parents=True)
-    staged = {"NOTICE.txt": NOTICE.encode()}
+    notice = NOTICE + (NOTICE_IBOOT if args.iboot32patcher_license is not None else "")
+    staged = {"NOTICE.txt": notice.encode()}
     staged["swift-LICENSE.txt"] = args.swift_license.read_bytes()
+    if args.iboot32patcher_license is not None:
+        if not args.iboot32patcher_license.is_file():
+            raise SystemExit(f"stage-notices: missing {args.iboot32patcher_license}")
+        staged["iBoot32Patcher-LICENSE"] = args.iboot32patcher_license.read_bytes()
     for package, names in LINKED.items():
         for name in names:
             source = args.checkouts / package / name
