@@ -249,16 +249,32 @@ extension SystemEdits {
         return (entryPath(fields[8]), mode)
     }
 
-    /// /usr/bin/tar `args`; its stdout, or an error with its stderr.
+    /// The host's tar `args`; its stdout, or an error with its stderr. Android ships toybox, not /usr/bin/tar.
+    static func tarInvocation(_ args: [String]) -> (executable: URL, arguments: [String]) {
+        #if os(Android)
+        return (URL(fileURLWithPath: "/system/bin/toybox"), ["tar"] + args)
+        #else
+        return (URL(fileURLWithPath: "/usr/bin/tar"), args)
+        #endif
+    }
+
     private static func tar(_ args: [String]) throws -> String {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        p.arguments = args
+        let invocation = tarInvocation(args)
+        p.executableURL = invocation.executable
+        p.arguments = invocation.arguments
         let out = Pipe()
         let err = Pipe()
         p.standardOutput = out
         p.standardError = err
-        try p.run()
+        do {
+            try p.run()
+        } catch {
+            throw FirmwareError(
+                .internal,
+                "Cydia: can't run tar at \(invocation.executable.path): \(error.localizedDescription)"
+            )
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         let errors = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
