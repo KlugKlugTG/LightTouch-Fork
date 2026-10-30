@@ -60,7 +60,7 @@ on:
         required: false
         default: v0.0.10
       guest_package_run_id:
-        description: Successful guest-package workflow run to use (blank selects the latest compatible run on this branch)
+        description: Successful guest-package workflow run to use (blank searches all branches for the latest compatible artifact)
         required: false
         default: ""
       jobs:
@@ -340,19 +340,38 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_RUN_ID: ${{ inputs.guest_package_run_id || '' }}
-          PACKAGE_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           WORKFLOW_ID=400843872
           CURRENT_PATCH_SHA="$(git hash-object ci/engine-patches/0011-engine-gles-map-buffer.patch)"
-          CURRENT_WORKFLOW_SHA="$(git hash-object .github/workflows/guest-package.yml)"
+          # Retention is storage policy, not a package-build input. Ignore those YAML lines so the
+          # already-built package stays reusable when we extend its retention period.
+          CURRENT_WORKFLOW_SHA="$(python3 - <<'PYHASH'
+          import hashlib, pathlib, re
+          text = pathlib.Path('.github/workflows/guest-package.yml').read_text()
+          text = re.sub(r'(?m)^[ \t]*retention-days:[ \t]*[0-9]+[ \t]*\r?$', '', text)
+          print(hashlib.sha256(text.encode()).hexdigest())
+          PYHASH
+          )"
           SELECTED_RUN=""
+
+          workflow_matches_source() {
+            local run_id="$1" package_sha package_patch package_workflow
+            package_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.head_sha')" || return 1
+            package_patch="$(gh api "repos/$GITHUB_REPOSITORY/contents/ci/engine-patches/0011-engine-gles-map-buffer.patch?ref=$package_sha" --jq '.sha')" || return 1
+            [ "$package_patch" = "$CURRENT_PATCH_SHA" ] || return 1
+            package_workflow="$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/guest-package.yml?ref=$package_sha" --jq '.content' | base64 --decode | python3 -c 'import hashlib,re,sys; text=sys.stdin.read(); text=re.sub(r"(?m)^[ \t]*retention-days:[ \t]*[0-9]+[ \t]*\r?$", "", text); print(hashlib.sha256(text.encode()).hexdigest())')" || return 1
+            [ "$package_workflow" = "$CURRENT_WORKFLOW_SHA" ]
+          }
+
           for attempt in $(seq 1 30); do
             if [ -n "$REQUESTED_RUN_ID" ]; then
               CANDIDATES="$REQUESTED_RUN_ID"
             else
-              CANDIDATES="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?branch=$PACKAGE_BRANCH&per_page=100" \
-                --jq '.workflow_runs | map(select(.conclusion == "success")) | sort_by(.created_at) | reverse | map(.id) | .[]')"
+              # Search every branch. The guest package is reusable when its patch and build recipe
+              # match; requiring the APK PR's branch misses valid artifacts from an earlier PR.
+              CANDIDATES="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?per_page=100" \
+                --jq '.workflow_runs[] | select(.conclusion == "success") | .id')"
             fi
 
             while IFS= read -r RUN_ID; do
@@ -360,31 +379,41 @@ jobs:
               HAS_ARTIFACT="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
                 --jq '[.artifacts[] | select(.name == "Un1box-guest-packages-39" and .expired == false)] | length')"
               [ "$HAS_ARTIFACT" -gt 0 ] || continue
-              PACKAGE_SHA="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq '.head_sha')"
-              PATCH_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/ci/engine-patches/0011-engine-gles-map-buffer.patch?ref=$PACKAGE_SHA" --jq '.sha')"
-              WORKFLOW_SHA="$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/workflows/guest-package.yml?ref=$PACKAGE_SHA" --jq '.sha')"
-              if [ "$PATCH_SHA" = "$CURRENT_PATCH_SHA" ] && [ "$WORKFLOW_SHA" = "$CURRENT_WORKFLOW_SHA" ]; then
+              if workflow_matches_source "$RUN_ID"; then
                 SELECTED_RUN="$RUN_ID"
                 break
               fi
-              echo "Skipping guest-package run $RUN_ID: its patch or build workflow differs from this APK source."
+              echo "Skipping guest-package run $RUN_ID: its GLES patch or package build recipe differs."
             done <<< "$CANDIDATES"
             [ -n "$SELECTED_RUN" ] && break
 
             if [ -n "$REQUESTED_RUN_ID" ]; then
               PACKAGE_STATUS="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REQUESTED_RUN_ID" --jq '.status')"
               [ "$PACKAGE_STATUS" != completed ] || break
+              if ! workflow_matches_source "$REQUESTED_RUN_ID"; then
+                echo '::error::The requested guest-package run has a different patch or build recipe.'
+                exit 1
+              fi
             else
-              PENDING_RUNS="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?branch=$PACKAGE_BRANCH&per_page=100" \
-                --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | length')"
-              [ "$PENDING_RUNS" -gt 0 ] || break
+              # Wait only for a pending package build with the same inputs, not unrelated runs.
+              PENDING_RUNS="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?per_page=100" \
+                --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress")] | .[].id')"
+              MATCHING_PENDING=0
+              while IFS= read -r RUN_ID; do
+                [ -n "$RUN_ID" ] || continue
+                if workflow_matches_source "$RUN_ID"; then
+                  MATCHING_PENDING=1
+                  break
+                fi
+              done <<< "$PENDING_RUNS"
+              [ "$MATCHING_PENDING" -gt 0 ] || break
             fi
             echo "Waiting for a matching serial-39 guest-package artifact ($attempt/30)..."
             sleep 20
           done
 
           [ -n "$SELECTED_RUN" ] || {
-            echo '::error::No successful serial-39 guest-package artifact matches this branch and source. Build/approve that workflow first, or provide guest_package_run_id.'
+            echo '::error::No unexpired serial-39 guest-package artifact with matching source was found across branches. Build/approve the guest-package workflow or provide guest_package_run_id.'
             exit 1
           }
           PACKAGE_DIR="$RUNNER_TEMP/guest-packages-39"
