@@ -70,6 +70,13 @@ enum K48Oracle {
         #expect(SystemEdits.fstabRO == "/dev/disk0s1 / hfs ro 0 1\n/dev/disk0s2 /private/var hfs rw,nosuid,nodev 0 2\n")
     }
 
+    @Test func jailbreakGetsWritableRootOnlyWhenTheKernelPatchIsApplied() {
+        #expect(SystemEdits.rootFstab(productMajor: 7, jailbreak: false, rootfsRemountPatchApplied: false) == SystemEdits.fstabRO)
+        #expect(SystemEdits.rootFstab(productMajor: 7, jailbreak: true, rootfsRemountPatchApplied: false) == SystemEdits.fstabRO)
+        #expect(SystemEdits.rootFstab(productMajor: 7, jailbreak: true, rootfsRemountPatchApplied: true) == SystemEdits.fstabRW)
+        #expect(SystemEdits.rootFstab(productMajor: 6, jailbreak: true, rootfsRemountPatchApplied: false) == SystemEdits.fstabRW)
+    }
+
     /// A dated build's data volume leaves timed alone (its network answers NTP in the device's time): no
     /// com.apple.timed switches, which on 6.x and 7.x would drop lockdown's zone; its ark says unbricked.
     @Test func datedLeavesTimedAlone() throws {

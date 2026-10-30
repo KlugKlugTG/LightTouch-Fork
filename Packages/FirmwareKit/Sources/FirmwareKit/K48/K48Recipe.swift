@@ -46,6 +46,9 @@ final class K48Board: Board {
     }
     let recipe: FirmwareEntry.Recipe, version: String, strategy: String, iboot: Bool, dataProtection: Bool
     var helper: URL?, patcher: URL?, mbr: URL?, vols: SystemEdits.Result?
+    /// The combined jailbreak kernel patches, retained between boot-file and volume construction.
+    var jailbreakKernel: Data?
+    var jailbreakRootfsRemountPatchApplied = false
     var gidComponents: [String] = [], ramdisk: String?
     var shipped: [String] {
         iboot ? ["iBoot.bin", "nor.bin", "gid-blobs.bin"] : ["kboot.bin"] + (kbootNOR ? ["nor.bin"] : [])
@@ -81,6 +84,30 @@ final class K48Board: Board {
         KBoot.defaultBootArgs + (jailbreak ? " " + jailbreakBootArg : "")
     }
     static let jailbreakBootArg = "amfi_get_out_of_my_way=1"
+
+    /// Apply the optional jailbreak patches independently. A kernel that does not match either exact signature stays
+    /// unchanged for that patch; the caller only enables iOS 7's rw root when the remount patch was applied.
+    static func patchJailbreakKernel(_ kernel: Data, log: (String) -> Void) -> (kernel: Data, rootfsRemount: Bool) {
+        var output = [UInt8](kernel)
+        do {
+            let (patched, found) = try SandboxPatch.apply(output)
+            output = patched
+            log("[sandbox] sb_evaluate patched at 0x\(String(found.address, radix: 16))")
+        } catch {
+            log("[sandbox] left stock: \(error)")
+        }
+        do {
+            let (patched, found) = try RootFSPatch.apply(output)
+            output = patched
+            log("[rootfs] remount patch at 0x\(String(found.address, radix: 16))")
+            return (Data(output), true)
+        } catch RootFSPatch.Error.notFound {
+            return (Data(output), false) // before iOS 7, or a kernel without the remount refusal
+        } catch {
+            log("[rootfs] left stock: \(error)")
+            return (Data(output), false)
+        }
+    }
 
     /// A prepared base's boot files (in the writable `base`) given a jailbroken base's boot-args (bootArgs): kboot.bin's
     /// boot_args command line, found through its trailer; or, on the iboot path, the string iBoot32Patcher wrote into
@@ -202,10 +229,15 @@ final class K48Board: Board {
         try FitCheck.checkBootArgs(c.fit, kernel: kernel, args: bootArgs)
         // A jailbroken device's kernel is sandbox-patched so Substrate's inserted library loads inside the built-in
         // app profiles; recorded here, applied to the boot kernel (kboot.bin below, or the iBoot kernelcache in volumes).
-        var jailbreakKernel: Data?
         if c.cydia != nil {
             try c.fit.check(FitCheck.sandboxPatch(kernel), required: false)
-            jailbreakKernel = (try? SandboxPatch.apply([UInt8](kernel)).kernel).map { Data($0) }
+            try c.fit.check(
+                FitCheck.rootfsRemountPatch(kernel), required: false,
+                outcome: "kept: root remains read-only unless the patch reaches the boot kernel"
+            )
+            let patched = Self.patchJailbreakKernel(kernel, log: c.log)
+            jailbreakKernel = patched.kernel
+            jailbreakRootfsRemountPatchApplied = patched.rootfsRemount
         }
         // both chains add it
         try c.fit.check(FitCheck.deviceTreeProperty(kernel, "arm-io/usb-complex", "hsic-enabled"), required: false)
@@ -274,23 +306,26 @@ final class K48Board: Board {
         try K48NAND.makeMBR(geometry: geometry, systemMiB: systemMiB).write(to: mbr)
         let parts = K48NAND.partitions(mbr: [UInt8](try Data(contentsOf: mbr)))
         var kernelcacheImg3: Data?
+        var rootfsRemountPatchApplied = !iboot && jailbreakRootfsRemountPatchApplied
         if iboot {
             guard let kc = try BuildComponents.load(c.ipsw, board: c.e.board)["KernelCache"] else {
                 throw FirmwareError(.unsupported, "\(c.e.id): the IPSW names no KernelCache")
             }
             let raw = try c.ipsw.read(kc)
-            // A jailbroken iBoot-chain device boots a sandbox-patched kernelcache: patch the plaintext and put it back
-            // in the IMG3 iBoot loads, re-encrypted with the component's key so iBoot decrypts it as it does the stock
-            // one. Unresolved kernels keep the stock kernelcache; bootFiles' sandbox-patch fit records it.
-            if c.cydia != nil {
+            // Re-wrap the complete jailbroken kernel (sandbox plus rootfs-remount patch) into the original IMG3.
+            // If re-wrapping fails, keep the stock kernel and keep iOS 7's root read-only to avoid a launchd reboot.
+            if c.cydia != nil, let patchedKernel = jailbreakKernel {
                 let k = try c.e.key(forPath: kc)
-                if let ivHex = k.iv, let iv = Data(hex: ivHex), let key = Data(hex: k.key),
-                    let plain = try? Data(contentsOf: c.decFile("kernelcache.mach")),
-                    let patched = try? SandboxPatch.rewrapKernelcache(
-                        original: raw, plaintextKernel: [UInt8](plain), iv: iv, key: key)
-                {
-                    c.log("[sandbox] kernelcache re-wrapped with sb_evaluate patched at 0x\(String(patched.found.address, radix: 16))")
-                    kernelcacheImg3 = patched.img3
+                if let ivHex = k.iv, let iv = Data(hex: ivHex), let key = Data(hex: k.key) {
+                    do {
+                        let img3 = try SandboxPatch.rewrapKernelcache(
+                            original: raw, patchedKernel: [UInt8](patchedKernel), iv: iv, key: key)
+                        kernelcacheImg3 = img3
+                        rootfsRemountPatchApplied = jailbreakRootfsRemountPatchApplied
+                        c.log("[iBoot] jailbroken kernelcache re-wrapped")
+                    } catch {
+                        c.log("[iBoot] kept stock kernelcache: \(error)")
+                    }
                 }
             }
             kernelcacheImg3 = kernelcacheImg3 ?? raw
@@ -308,6 +343,7 @@ final class K48Board: Board {
             helpers: c.o.guestTools,
             kernelcache: kernelcacheImg3,
             kernel: try Data(contentsOf: c.decFile("kernelcache.mach"), options: .alwaysMapped),
+            rootfsRemountPatchApplied: rootfsRemountPatchApplied,
             dataVolumeUUID: Array(SHA256.hash(data: Data("k48 data volume \(c.seed)".utf8)).prefix(8)),
             fit: c.fit,
             log: c.log

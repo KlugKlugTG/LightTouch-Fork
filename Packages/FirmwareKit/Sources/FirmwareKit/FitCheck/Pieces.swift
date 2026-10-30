@@ -188,6 +188,21 @@ extension FitCheck {
         }
     }
 
+    /// The iOS 7 rootfs-remount patch needed when the jailbreak's fstab requests `/` read-write. A missing site is
+    /// expected on older kernels; an ambiguous site or changed branch is recorded as a misfit and leaves `/` read-only.
+    public static func rootfsRemountPatch(_ kernel: Data?) -> Fit {
+        let piece = "jailbreak rootfs remount patch"
+        guard let kernel else { return Fit(piece, fits: false, "no decrypted kernelcache to check it against") }
+        do {
+            let found = try RootFSPatch.locate([UInt8](kernel))
+            return Fit(piece, fits: true, "rootfs remount check at 0x\(String(found.address, radix: 16)) (\(found.original.hexString))")
+        } catch RootFSPatch.Error.notFound {
+            return Fit(piece, fits: true, "no matching remount refusal on this kernel: nothing to patch")
+        } catch {
+            return Fit(piece, fits: false, "\(error)")
+        }
+    }
+
     /// bootArgs, recorded in `log`: amfi_allow_any_signature is required; an unread cs_enforcement_disable is a warning.
     static func checkBootArgs(_ log: Log, kernel: Data?, args: String) throws {
         for f in bootArgs(kernel, args) {

@@ -121,10 +121,19 @@ public enum SandboxPatch {
         original raw: Data, plaintextKernel kernel: [UInt8], iv: Data, key: Data
     ) throws -> (img3: Data, found: Found) {
         let patched = try apply(kernel)
-        var payload = complzssWrap(patched.kernel)
+        let img3 = try rewrapKernelcache(original: raw, patchedKernel: patched.kernel, iv: iv, key: key)
+        return (img3, patched.found)
+    }
+
+    /// Re-wrap a plaintext kernel that already carries one or more patches. Used when the jailbreak combines the
+    /// sandbox and rootfs-remount fixes before putting the kernel back in the original IMG3.
+    public static func rewrapKernelcache(
+        original raw: Data, patchedKernel: [UInt8], iv: Data, key: Data
+    ) throws -> Data {
+        var payload = complzssWrap(patchedKernel)
         if payload.count % 16 != 0 { payload.append(contentsOf: repeatElement(0, count: 16 - payload.count % 16)) }
         let cipher = try AESCBC.crypt(Data(payload), iv: iv, key: key, decrypt: false)
-        return (try rebuildIMG3(raw, data: [UInt8](cipher)), patched.found)
+        return try rebuildIMG3(raw, data: [UInt8](cipher))
     }
 
     /// A valid Apple-LZSS stream of all literals (flag byte 0xFF then eight bytes), so no compressor is needed: iBoot's
