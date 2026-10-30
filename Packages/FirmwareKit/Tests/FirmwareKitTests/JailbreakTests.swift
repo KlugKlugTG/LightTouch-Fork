@@ -189,17 +189,6 @@ struct JailbreakTests {
 struct CydiaInstallTests {
     let fm = FileManager.default
 
-    @Test func tarUsesThePlatformHostTool() {
-        let invocation = SystemEdits.Cydia.tarInvocation(["-tf", "archive.tar"])
-        #if os(Android)
-        #expect(invocation.executable.path == "/system/bin/toybox")
-        #expect(invocation.arguments == ["tar", "-tf", "archive.tar"])
-        #else
-        #expect(invocation.executable.path == "/usr/bin/tar")
-        #expect(invocation.arguments == ["-tf", "archive.tar"])
-        #endif
-    }
-
     /// The bootstrap's dpkg status, Patcyh between two others, as freeze.tar's has it.
     static let status =
         "Package: apt7\nStatus: install ok installed\n\nPackage: com.saurik.patcyh\nVersion: 1.2.0\n\n"

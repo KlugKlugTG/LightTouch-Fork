@@ -131,13 +131,6 @@ public enum SystemEdits {
     static let fstab = "private/etc/fstab"
     static let fstabRW = "/dev/disk0s1 / hfs rw 0 1\n/dev/disk0s2 /private/var hfs rw,nosuid,nodev 0 2\n"
     static let fstabRO = fstabRW.replacingOccurrences(of: "/ hfs rw 0", with: "/ hfs ro 0")
-
-    /// iOS 7's stock kernel rejects launchd's root read-write remount. Only request it for jailbreaks whose exact
-    /// kernel check was patched and whose patched kernel made it into the boot chain.
-    static func rootFstab(productMajor: Int, jailbreak: Bool, rootfsRemountPatchApplied: Bool) -> String {
-        let safeReadWrite = productMajor < 7 || (jailbreak && rootfsRemountPatchApplied)
-        return safeReadWrite ? fstabRW : fstabRO
-    }
     static let daemons = "System/Library/LaunchDaemons"
     static let springBoardJob = daemons + "/com.apple.SpringBoard.plist"
     static let msmJob = daemons + "/com.apple.mobile.storage_mounter.plist"
@@ -219,7 +212,6 @@ public enum SystemEdits {
         helpers: URL,
         kernelcache: Data? = nil,
         kernel: Data? = nil,
-        rootfsRemountPatchApplied: Bool = false,
         dataVolumeUUID: [UInt8]? = nil,
         fit: FitCheck.Log = FitCheck.Log(),
         log: (String) -> Void = { _ in }
@@ -338,16 +330,8 @@ public enum SystemEdits {
             productVersion = systemVersion?["ProductVersion"] as? String ?? ""
             productBuild = systemVersion?["ProductBuildVersion"] as? String ?? ""
             productMajor = Int(productVersion.split(separator: ".").first ?? "") ?? 0
-            // 7.x's stock kernel rejects launchd's rw remount and reboots. A jailbreak may use rw only when the
-            // precise rootfs check was patched and that kernel made it into the boot chain; otherwise stay read-only.
-            if productMajor >= 7 && o.jailbreak && !rootfsRemountPatchApplied {
-                log("iOS \(productMajor): root stays read-only because the jailbreak remount patch was not applied")
-            }
-            try put(Data(rootFstab(
-                productMajor: productMajor,
-                jailbreak: o.jailbreak,
-                rootfsRemountPatchApplied: rootfsRemountPatchApplied
-            ).utf8), at: fstab)
+            // 7.x's launchd cannot remount / rw (mount_hfs: Operation not permitted) and reboots; keep its stock ro root
+            try put(Data((productMajor >= 7 ? fstabRO : fstabRW).utf8), at(fstab))
             if o.webProxy {
                 try fit.check(
                     FitCheck.webProxy(FitCheck.Firmware(root: m, arch: "armv7")),
