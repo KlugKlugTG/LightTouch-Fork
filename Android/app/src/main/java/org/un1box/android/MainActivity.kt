@@ -796,6 +796,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
         if (spent) { restartFirmwareForPreparation(); return }
         val selectedIpsw = prep.ipswPath
         val selectedRom = if (needsBootrom(chosen.board)) prep.romPath else ""
+        val requestJailbreak = prep.jailbreak && chosen.board != "n72ap"
         prep.importError = ""
         prep.preparation = Bundle().apply { putString("state", "starting"); putString("firmwareId", chosen.id) }
         startForegroundService(Intent(this, FirmwareService::class.java))
@@ -803,7 +804,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, GuestHost {
             try {
                 // firmwarekit bakes the APK's own guest helpers and packages into the system.
                 val tools = GuestTools.firmwareTools(this)
-                val state = worker.start(chosen.id, selectedIpsw, tools.absolutePath, selectedRom)
+                val state = worker.start(chosen.id, selectedIpsw, tools.absolutePath, selectedRom, requestJailbreak)
                 handler.post { prep.preparation = state }
             } catch (e: Exception) { handler.post { prep.preparation = Bundle().apply { putString("state", "failed"); putString("error", e.message ?: "Cannot start preparation"); putBoolean("consumed", true) } } }
         }, "prepare-start").start()

@@ -50,6 +50,7 @@ internal class PrepareState {
     var romLabel by mutableStateOf("")
     var romChecking by mutableStateOf(false)
     var romError by mutableStateOf("")
+    var jailbreak by mutableStateOf(false)
     var preparation by mutableStateOf<Bundle?>(null)
     var importError by mutableStateOf("")
     /** Adding the prepared output as a device: the phase shown, and how far it is (negative while unknown). */
@@ -197,7 +198,10 @@ private fun DeviceStep(state: PrepareState, onAdvanced: () -> Unit) {
 private fun DeviceRow(state: PrepareState, product: String, detail: String, support: Support) {
     ChoiceRow(if (product.startsWith("iPad")) LtIcons.Tablet else LtIcons.Phone, shortProductName(product), detail, true, "prepare_device_$product", support) {
         state.productType = product
-        if (state.firmware?.productType != product) state.firmwareId = ""
+        if (state.firmware?.productType != product) {
+            state.firmwareId = ""
+            state.jailbreak = false
+        }
         state.step = PrepareStep.VERSION
     }
 }
@@ -218,7 +222,9 @@ private fun VersionStep(state: PrepareState) {
             val detail = (if (firmware.id == recommendedFirmware) "Recommended · " else "") + released(firmware) +
                 if (firmware.id in state.supported) "" else "\nPrepared on a computer, then added here"
             ChoiceRow(null, "iOS ${firmware.label}", detail, true, "prepare_version_${firmware.id}") {
-                state.firmwareId = firmware.id; state.step = PrepareStep.FILES
+                state.firmwareId = firmware.id
+                state.jailbreak = false
+                state.step = PrepareStep.FILES
             }
         }
     }
@@ -322,6 +328,34 @@ private fun ColumnScope.FilesStep(state: PrepareState, busy: Boolean, onDownload
                 Text("Downloads come from ${rom.sources}, and must match the ${rom.label} boot ROM exactly.", Modifier.padding(top = 8.dp),
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+        }
+    }
+    val jailbreakUnavailable = firmware.board == "n72ap"
+    Card(
+        icon = LtIcons.Bag,
+        title = "Jailbreak",
+        done = state.jailbreak && !jailbreakUnavailable,
+        detail = "Optional · Cydia, Substrate and afc2 file access"
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Install during preparation. iOS 7 root access is enabled only when its kernel patch is verified.",
+                Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Switch(
+                checked = state.jailbreak && !jailbreakUnavailable,
+                onCheckedChange = { state.jailbreak = it },
+                enabled = !busy && !jailbreakUnavailable,
+                modifier = Modifier.testTag("prepare_jailbreak")
+            )
+        }
+        if (jailbreakUnavailable) {
+            Text(
+                "Not available for iPod touch 2G: Cydia's Substrate can prevent later boots.",
+                Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
         }
     }
     Spacer(Modifier.height(12.dp))
