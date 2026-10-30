@@ -73,6 +73,13 @@ struct SandboxPatchTests {
         let (img3, _) = try SandboxPatch.rewrapKernelcache(original: raw, plaintextKernel: plain, iv: iv, key: key)
         let back = [UInt8](try LZSS.complzss(IMG3.decrypt(img3, iv: iv, key: key)))
         #expect(back == want, "the re-wrapped kernelcache decrypts back to the patched kernel")
+
+        // The jailbreak applies sandbox and rootfs fixes together before re-wrapping, so also exercise the path that
+        // accepts an already-patched plaintext kernel and must not apply the sandbox change a second time.
+        let prepatchedIMG3 = try SandboxPatch.rewrapKernelcache(
+            original: raw, patchedKernel: want, iv: iv, key: key)
+        let prepatchedBack = [UInt8](try LZSS.complzss(IMG3.decrypt(prepatchedIMG3, iv: iv, key: key)))
+        #expect(prepatchedBack == want, "the generic re-wrapper preserves an already-patched kernel byte-for-byte")
     }
 
     /// Corpus: the two reported bases plus a board of each kboot kind resolve from a fresh decrypt. k48ap-8J3 is
