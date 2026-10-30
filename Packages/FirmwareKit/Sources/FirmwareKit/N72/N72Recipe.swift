@@ -64,6 +64,13 @@ final class N72Board: Board {
     let needsSeal = false
     let recipe: FirmwareEntry.Recipe, model: String, blocks: Int, dataProtection: Bool
     var helper: URL?, bootrom: URL?, ident: UnitIdentity?
+
+    /// Cydia installs Substrate's launchd hook on the iPod touch 2G; after its first boot that hook hangs launchd.
+    /// Keep ordinary preparation unaffected, but reject an explicitly requested jailbreak before reading the IPSW.
+    static func jailbreakUnavailable(options: [String: Bool]) -> String? {
+        guard options["jailbreak"] == true else { return nil }
+        return "no jailbreak on the iPod touch 2G yet: Cydia's Substrate prevents later boots"
+    }
     var epoch = 0, major = 0, kcPath = "", kcMember = "", prefix = ""
     var derived: [String: Any] = [:]
     var shipped: [String] { ["nor.bin", "gid-blobs.bin"] + (major >= 3 ? ["iBoot.bin"] : []) }
@@ -83,6 +90,9 @@ final class N72Board: Board {
     }
 
     func check(_ c: Recipe.Context) throws {
+        if let reason = Self.jailbreakUnavailable(options: recipe.options) {
+            throw FirmwareError(.unsupported, "\(c.e.id): \(reason)")
+        }
         let fm = FileManager.default
         helper = c.o.helper
         bootrom = c.o.bootrom.flatMap { fm.fileExists(atPath: $0.path) ? $0 : nil } ?? Self.bootromPath(helper: helper)

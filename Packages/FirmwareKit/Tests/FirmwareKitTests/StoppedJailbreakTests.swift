@@ -109,9 +109,8 @@ import Testing
         #expect(throws: FirmwareError.self) { try K48Board.jailbreakBootFiles(base: base) }
     }
 
-    /// An N72 device (the generated store) with a user's file and a set-user-ID-less volume: after the jailbreak the
-    /// published generation has Cydia (cydo set-user-ID root), afc2, the user's file, and a lock that says jailbroken.
-    @Test func existingDeviceKeepsItsFilesAndSaysJailbroken() async throws {
+    /// N72 is refused before any stopped-volume edit: Substrate's launchd hook makes later boots hang.
+    @Test func existingN72DeviceRefusesJailbreakWithoutChangingItsRecord() async throws {
         let root = try Fixtures.tempDir("stopped-jailbreak")
         defer { try? fm.removeItem(at: root) }
         let bootstrap = try CydiaInstallTests().bootstrap(in: root.appendingPathComponent("bootstrap"))
@@ -146,32 +145,13 @@ import Testing
             ],
         ]).write(to: device.appendingPathComponent(DeviceRecord.name))
 
-        try await StoppedVolumeEdit.jailbreak(device: device, bootstrap: bootstrap)
-
-        let published = try DeviceRecord.object(Data(contentsOf: device.appendingPathComponent(DeviceRecord.name)))
-        let generation = URL(fileURLWithPath: try #require((published["base"] as? [String: String])?["path"]))
-        #expect(try DeviceLock.read(base: generation)?.jailbroken == true)
-        #expect(try DeviceLock.read(base: base)?.jailbroken == false, "the prepared base is untouched")
-        let volume = try HFSPlusVolume(
-            try #require(
-                try VolumeRebuild.rebuild(
-                    base: generation.appendingPathComponent("nand"),
-                    overlay: nil,
-                    into: root.appendingPathComponent("verify")
-                ).first
-            ).image
-        )
-        #expect(try volume.contents(volume.record(at: "private/var/mobile/Media/user.txt")) == Data("saved game".utf8))
-        #expect(try volume.contents(volume.record(at: "Applications/Cydia.app/Cydia")) == Data("cydia".utf8))
-        let cydo = try volume.record(at: "usr/libexec/cydia/cydo")
-        #expect(cydo.uid == 0 && cydo.mode & 0o7777 == 0o6755)
-        let services = try PropertyListSerialization.propertyList(
-            from: volume.contents(volume.record(at: SystemEdits.lockdownServices)),
-            format: nil
-        )
-        #expect((services as? [String: Any])?["com.apple.afc2"] != nil)
-        await #expect(throws: FirmwareError.self, "once only") {
+        await #expect(throws: FirmwareError.self) {
             try await StoppedVolumeEdit.jailbreak(device: device, bootstrap: bootstrap)
         }
+
+        let published = try DeviceRecord.object(Data(contentsOf: device.appendingPathComponent(DeviceRecord.name)))
+        #expect((published["base"] as? [String: String])?["path"] == base.path)
+        #expect(try DeviceLock.read(base: base)?.jailbroken == false)
+        #expect(fm.fileExists(atPath: base.appendingPathComponent("device.lock.json").path))
     }
 }

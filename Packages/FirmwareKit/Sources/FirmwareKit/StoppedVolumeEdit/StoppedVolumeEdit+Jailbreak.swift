@@ -20,6 +20,9 @@ extension StoppedVolumeEdit {
         guard let lock, (Int(lock.productVersion?.split(separator: ".").first ?? "") ?? 0) >= 2 else {
             throw FirmwareError(.unsupported, "the jailbreak needs iPhone OS 2.0 or later")
         }
+        if lock.board == "n72ap", let reason = N72Board.jailbreakUnavailable(options: ["jailbreak": true]) {
+            throw FirmwareError(.unsupported, reason)
+        }
         guard !lock.jailbroken else { throw FirmwareError(.unsupported, "this device is jailbroken already") }
         let session = try await begin(device: device, policy: policy, log: log)
         do {

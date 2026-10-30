@@ -5,6 +5,14 @@ import Testing
 
 /// N72 format contracts, independent legacy digests, and optional stock-firmware bake checks.
 @Suite struct N72Tests {
+    /// Cydia's Substrate hook makes later boots hang on this device. This must reject only the optional jailbreak;
+    /// a normal fresh preparation remains allowed.
+    @Test func jailbreakIsUnavailableOnlyWhenRequested() {
+        #expect(N72Board.jailbreakUnavailable(options: ["jailbreak": true]) != nil)
+        #expect(N72Board.jailbreakUnavailable(options: ["jailbreak": false]) == nil)
+        #expect(N72Board.jailbreakUnavailable(options: [:]) == nil)
+    }
+
     /// Restore ramdisks are encrypted IMG3s outside all_flash. Omitting their
     /// KBAGs aborts the AES model during a stock USB restore, before bootx.
     @Test func restoreRamdiskKeysAreExported() throws {
