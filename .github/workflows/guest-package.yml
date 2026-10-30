@@ -131,7 +131,7 @@ jobs:
             ${{ runner.temp }}/guest-package/armv7.itpack
             ${{ runner.temp }}/guest-package/SHA256SUMS
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
       - name: Keep guest build log on failure
         if: failure()

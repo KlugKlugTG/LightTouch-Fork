@@ -85,7 +85,10 @@ are armv6 iOS binaries. They link with Xcode's `ld` on a Mac. qemu-ios
 `contrib/armv6-toolchain/README.md`, "Setting up a Mac to build the guest package", lists what that Mac
 needs, where each piece came from, and what does not work: Xcode 27.1 (not Command Line Tools alone),
 the iPhoneOS 3.1.3 and 3.2 SDKs, and `ldid`. LT Bench needs no SDK. The script copies the sources over
-with `rsync` (to `~/ltpkg-build` on the Mac), builds there, and copies the results back.
+with `rsync` (to `~/ltpkg-build` on the Mac), builds there, and copies the results back. Remote guest-package,
+firmware-tools and LT Bench builds, plus the macOS release build, run under `/usr/bin/caffeinate -i -s` so the Mac
+will not idle-sleep, and will stay awake on AC power, during the command. The assertion ends on success or failure,
+changes no saved power settings and does not keep the display awake; connect the Mac to power for long release builds.
 
 The iPhoneOS 3.1.3 SDK (headers and link stubs for the guest link) also ships in Apple's original
 installer, which the Internet Archive keeps in its iOS Firmware Exhibit Collection:

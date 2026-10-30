@@ -46,11 +46,13 @@ private:
         const char *mode=getenv("LT_ADPF");  // "off" for A/B measurements
         if(android_get_device_api_level()<33 || (mode && !strcmp(mode,"off"))){failed_=true;return false;}
         if(!report_) {
-            void *android=dlopen("libandroid.so",RTLD_NOW|RTLD_LOCAL);
-            auto manager=android?reinterpret_cast<GetManager>(dlsym(android,"APerformanceHint_getManager")):nullptr;
-            create_=android?reinterpret_cast<Create>(dlsym(android,"APerformanceHint_createSession")):nullptr;
-            report_=android?reinterpret_cast<Report>(dlsym(android,"APerformanceHint_reportActualWorkDuration")):nullptr;
-            set_threads_=android?reinterpret_cast<SetThreads>(dlsym(android,"APerformanceHint_setThreads")):nullptr;
+            // Keep libandroid loaded for the process lifetime. getManager may start a binder thread; unloading the
+            // library when the HAL has no sessions can leave that thread locking a destroyed mutex during boot.
+            android_library_=dlopen("libandroid.so",RTLD_NOW|RTLD_LOCAL);
+            auto manager=android_library_?reinterpret_cast<GetManager>(dlsym(android_library_,"APerformanceHint_getManager")):nullptr;
+            create_=android_library_?reinterpret_cast<Create>(dlsym(android_library_,"APerformanceHint_createSession")):nullptr;
+            report_=android_library_?reinterpret_cast<Report>(dlsym(android_library_,"APerformanceHint_reportActualWorkDuration")):nullptr;
+            set_threads_=android_library_?reinterpret_cast<SetThreads>(dlsym(android_library_,"APerformanceHint_setThreads")):nullptr;
             manager_=manager?manager():nullptr;
             if(!manager_ || !create_ || !report_){failed_=true;return false;}
         }
@@ -85,6 +87,7 @@ private:
         }
         return total;
     }
+    void *android_library_=nullptr;  // intentionally not dlclosed; libandroid's hint binder thread may outlive this call
     Manager *manager_=nullptr;
     Create create_=nullptr;
     Report report_=nullptr;
