@@ -228,24 +228,48 @@ public enum K48IBoot {
 
     // MARK: - iBoot patching
 
-    /// Locate iBoot32Patcher: the bundled copy first (next to firmwarekit itself, then next to the helper; both are
-    /// the app's Contents/MacOS, where the archive ships it), then FIRMWAREKIT_IBOOT_PATCHER / IBOOT32PATCHER
-    /// (development runs), then a bare name on PATH.
+    static let patcherNames = ["iBoot32Patcher", "libiboot32patcher.so", "iBoot32Patcher.exe"]
+
+    /// Locate iBoot32Patcher: the bundled copy first (next to firmwarekit itself, then next to the helper; macOS/Linux
+    /// ship `iBoot32Patcher`, Android packages `libiboot32patcher.so` in nativeLibraryDir), then
+    /// FIRMWAREKIT_IBOOT_PATCHER / IBOOT32PATCHER, then a copy resolved on PATH.
     public static func patcher(helper: URL?) -> URL {
+        let fm = FileManager.default
         for dir in [Bundle.main.executableURL, helper].compactMap({
             $0?.resolvingSymlinksInPath().deletingLastPathComponent()
         }) {
-            let u = dir.appendingPathComponent("iBoot32Patcher")
-            if FileManager.default.isExecutableFile(atPath: u.path) { return u }
+            for name in patcherNames {
+                let u = dir.appendingPathComponent(name)
+                if fm.isExecutableFile(atPath: u.path) { return u }
+            }
         }
         let env = ProcessInfo.processInfo.environment
-        if let p = env["FIRMWAREKIT_IBOOT_PATCHER"] ?? env["IBOOT32PATCHER"] { return URL(fileURLWithPath: p) }
+        if let p = (env["FIRMWAREKIT_IBOOT_PATCHER"] ?? env["IBOOT32PATCHER"])?.trimmingCharacters(in: .whitespaces),
+            !p.isEmpty
+        {
+            return URL(fileURLWithPath: p)
+        }
+        if let pathEnv = env["PATH"] {
+            #if os(Windows)
+            let sep: Character = ";"
+            #else
+            let sep: Character = ":"
+            #endif
+            for raw in pathEnv.split(separator: sep) where !raw.isEmpty {
+                let dir = URL(fileURLWithPath: String(raw))
+                for name in patcherNames {
+                    let u = dir.appendingPathComponent(name)
+                    if fm.isExecutableFile(atPath: u.path) { return u }
+                }
+            }
+        }
         return URL(fileURLWithPath: "iBoot32Patcher")
     }
 
     /// A pattern-patched iBoot (RSA/personalization bypass, debug boot, the boot-args string), byte-for-byte what
     /// `iBoot32Patcher --rsa --debug -b <boot-args>` produces. `-a` (environment boot args) crashes 817.29, so `-b`.
-    /// The patcher returns status 1 even on success; the output existing, keeping its size and differing is the check.
+    /// Invokes `tool` directly rather than `/usr/bin/env` (absent on Android). The patcher returns status 1 even on
+    /// success; the output existing, keeping its size and differing is the check.
     public static func patchIBoot(_ iboot: Data, patcher tool: URL, bootArgs: String, log: (String) -> Void) throws
         -> Data
     {
@@ -257,8 +281,9 @@ public enum K48IBoot {
         try iboot.write(to: src)
         let p = Process()
         let out = Pipe()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = [tool.path, src.path, dst.path, "--rsa", "--debug", "-b", bootArgs]
+        p.executableURL = tool
+        p.arguments = [src.path, dst.path, "--rsa", "--debug", "-b", bootArgs]
+        p.standardInput = FileHandle.nullDevice
         p.standardOutput = out
         p.standardError = out
         do { try p.run() } catch {

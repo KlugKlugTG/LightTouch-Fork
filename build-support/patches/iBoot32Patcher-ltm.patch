@@ -1,3 +1,164 @@
+--- a/include/arm32_defs.h
++++ b/include/arm32_defs.h
+@@ -25,98 +25,98 @@
+ #define ARM32_THUMB_ADD 2
+ #define ARM32_THUMB_SUB 3
+ 
+ #define ARM32_THUMB_IT_NE __builtin_bswap16(0x18BF)
+ #define ARM32_THUMB_IT_EQ __builtin_bswap16(0x08BF)
+ #define ARM32_THUMB_ITE_NE __builtin_bswap16(0x14BF)
+ 
+ struct arm32_thumb_LDR_T3 {
+-	uint8_t rn : 4;
+-	uint16_t pad : 12;
+-	uint16_t imm12 : 12;
+-	uint8_t rt : 4;
++	uint32_t rn : 4;
++	uint32_t pad : 12;
++	uint32_t imm12 : 12;
++	uint32_t rt : 4;
+ } __attribute__ ((packed));
+ 
+ struct arm32_thumb_MOVW {
+-	uint8_t imm4 : 4;
+-	uint8_t pad0 : 6;
+-	uint8_t i : 1;
+-	uint8_t pad1 : 5;
+-	uint8_t imm8;
+-	uint8_t rd : 4;
+-	uint8_t imm3 : 3;
+-	uint8_t bit31 : 1;
++	uint32_t imm4 : 4;
++	uint32_t pad0 : 6;
++	uint32_t i : 1;
++	uint32_t pad1 : 5;
++	uint32_t imm8 : 8;
++	uint32_t rd : 4;
++	uint32_t imm3 : 3;
++	uint32_t bit31 : 1;
+ } __attribute__((packed));
+ 
+ struct arm32_thumb_BL {
+-	uint16_t offset : 11;
+-	uint8_t h : 1;
+-	uint8_t padd : 4;
+-	uint16_t offset2 : 11;
+-	uint8_t h2 : 1;
+-	uint8_t padd2 : 4;
++	uint32_t offset : 11;
++	uint32_t h : 1;
++	uint32_t padd : 4;
++	uint32_t offset2 : 11;
++	uint32_t h2 : 1;
++	uint32_t padd2 : 4;
+ } __attribute__((packed));
+ 
+ struct arm32_thumb_MOVT_W {
+-	uint8_t imm4 : 4;
+-	uint8_t pad0 : 6;
+-	uint8_t i : 1;
+-	uint8_t pad1 : 5;
+-	uint8_t imm8;
+-	uint8_t rd : 4;
+-	uint8_t imm3 : 3;
+-	uint8_t bit31 : 1;
++	uint32_t imm4 : 4;
++	uint32_t pad0 : 6;
++	uint32_t i : 1;
++	uint32_t pad1 : 5;
++	uint32_t imm8 : 8;
++	uint32_t rd : 4;
++	uint32_t imm3 : 3;
++	uint32_t bit31 : 1;
+ } __attribute__((packed));
+ 
+ struct arm32_thumb_BW_T4 {
+-	uint16_t imm10 : 10;
+-	uint8_t s : 1;
+-	uint8_t pad0 : 5;
+-	uint16_t imm11 : 11;
+-	uint8_t j2 : 1;
+-	uint8_t bit12 : 1;
+-	uint8_t j1 : 1;
+-	uint8_t pad1 : 2;
++	uint32_t imm10 : 10;
++	uint32_t s : 1;
++	uint32_t pad0 : 5;
++	uint32_t imm11 : 11;
++	uint32_t j2 : 1;
++	uint32_t bit12 : 1;
++	uint32_t j1 : 1;
++	uint32_t pad1 : 2;
+ } __attribute__((packed));
+ 
+ struct arm32_thumb_IT_T1 {
+-	uint8_t mask : 4;
+-	uint8_t cond : 4;
+-	uint8_t pad : 8;
++	uint16_t mask : 4;
++	uint16_t cond : 4;
++	uint16_t pad : 8;
+ }__attribute__((packed));
+ 
+ struct arm32_thumb_LDR {
+-	uint8_t imm8;
+-	uint8_t rd : 3;
+-	uint8_t padd : 5;
++	uint16_t imm8 : 8;
++	uint16_t rd : 3;
++	uint16_t padd : 5;
+ } __attribute__((packed));
+ 
+ struct arm32_thumb_hi_reg_op {
+-	uint8_t rd : 3;
+-	uint8_t rs : 3;
+-	uint8_t h2 : 1;
+-	uint8_t h1 : 1;
+-	uint8_t op : 2;
+-	uint8_t pad : 6;
++	uint16_t rd : 3;
++	uint16_t rs : 3;
++	uint16_t h2 : 1;
++	uint16_t h1 : 1;
++	uint16_t op : 2;
++	uint16_t pad : 6;
+ } __attribute__((packed));
+ 
+ struct arm32_thumb {
+-	uint8_t offset : 8;
+-	uint8_t rd : 3;
+-	uint8_t op : 2;
+-	uint8_t one : 1;
+-	uint8_t z: 1;
+-	uint8_t zero : 1;
++	uint16_t offset : 8;
++	uint16_t rd : 3;
++	uint16_t op : 2;
++	uint16_t one : 1;
++	uint16_t z: 1;
++	uint16_t zero : 1;
+ } __attribute__((packed));
+ 
+ struct arm32_thumb_MOVT {
+-    uint16_t imm4 : 4;   // Top 4 bits of the immediate value
+-    uint16_t pad0 : 6;   // Constant value bits (part of the encoding, usually fixed)
+-    uint16_t i : 1;      // The highest bit of the immediate value
+-    uint16_t pad1 : 5;   // Constant value bits (part of the encoding, usually fixed)
+-    uint8_t imm8;        // Lower 8 bits of the immediate value
+-    uint8_t rd : 4;      // Destination register
+-    uint8_t imm3 : 3;    // Middle 3 bits of the immediate value
+-    uint8_t bit31 : 1;   // Should be 0
++    uint32_t imm4 : 4;   // Top 4 bits of the immediate value
++    uint32_t pad0 : 6;   // Constant value bits (part of the encoding, usually fixed)
++    uint32_t i : 1;      // The highest bit of the immediate value
++    uint32_t pad1 : 5;   // Constant value bits (part of the encoding, usually fixed)
++    uint32_t imm8 : 8;        // Lower 8 bits of the immediate value
++    uint32_t rd : 4;      // Destination register
++    uint32_t imm3 : 3;    // Middle 3 bits of the immediate value
++    uint32_t bit31 : 1;   // Should be 0
+ } __attribute__((packed));
+ 
+ #endif
 --- a/src/functions.c
 +++ b/src/functions.c
 @@ -129,6 +129,17 @@

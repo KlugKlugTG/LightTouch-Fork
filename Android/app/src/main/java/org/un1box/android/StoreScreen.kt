@@ -254,6 +254,13 @@ internal class StoreModel(context: Context, private val muxSocket: () -> String?
         crash = "Reading the guest's crash reports…"
         background("store-crash") {
             val text = try {
+                apps.lastCrash(socket)?.let { (name, body) ->
+                    val keep = Regex("^(Process|Date/Time|Date:|Hardware Model:|OS Version|Exception Type|Exception Code|Reason:|Crashed Thread|Dyld Error Message|  Symbol not found|  Referenced from|  Expected in|Termination Reason|Application Specific Information)")
+                    val lines = body.lines()
+                    val dyld = lines.indexOfFirst { it.startsWith("Dyld Error Message") }
+                    name + "\n\n" + lines.filterIndexed { i, l -> keep.containsMatchIn(l) || (dyld >= 0 && i in dyld + 1..dyld + 3) }
+                        .distinct().joinToString("\n").ifEmpty { body.take(1500) }
+                } ?: "The guest has no crash reports."
                 val last = runCatching { apps.lastCrash(socket) }.getOrNull()
                 GuestCrashDiagnosis.report(stateDir(), last?.first, last?.second, null)
             } catch (e: Exception) { "Could not read crash reports: ${e.message}" }

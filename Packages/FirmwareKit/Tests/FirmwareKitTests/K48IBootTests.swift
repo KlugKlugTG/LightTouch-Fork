@@ -162,4 +162,21 @@ struct K48IBootTests {
             }
         }
     }
+
+    @Test func patcherDiscoveryFindsAndroidNativeLibSibling() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("k48-patcher-test-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: dir) }
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let helper = dir.appendingPathComponent("liblighttouch_oneshot.so")
+        let patcher = dir.appendingPathComponent("libiboot32patcher.so")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: helper)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: patcher)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: patcher.path)
+        let resolved = K48IBoot.patcher(helper: helper)
+        if resolved.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL {
+            #expect(resolved.lastPathComponent == "libiboot32patcher.so")
+        }
+    }
 }

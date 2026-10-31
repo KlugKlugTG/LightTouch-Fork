@@ -33,6 +33,7 @@
 #include "display_lease.h"
 #include "frame_cache.h"
 #include "touch_mapping_result.h"
+#include "display_scan.h"
 #include "experimental_tcg_cache.h"
 #include "performance_hint.h"
 #include "cpu_affinity.h"
@@ -258,11 +259,9 @@ jstring string(JNIEnv *e, const std::string &s) {
 std::string result(lt_status status, const lt_error &error) {
     return status == LT_OK ? "" : (error.message[0] ? error.message : "Native operation failed");
 }
-struct Viewport { double left, top, width, height; };
+using Viewport = display_scan::Viewport;
 Viewport viewport(int width, int height, const lt_frame_info &source) {
-    const double scale = std::min(double(width) / std::max(source.width, 1u), double(height) / std::max(source.height, 1u));
-    double w = source.width * scale, h = source.height * scale;
-    return {(width-w)/2, (height-h)/2, w, h};
+    return display_scan::viewport(width, height, std::max(source.width, 1u), std::max(source.height, 1u));
 }
 Viewport viewport(int width, int height) { return viewport(width, height, frame); }
 lt_status open_library(const char *root,lt_error *error) {
@@ -418,8 +417,10 @@ void present() {
                 geometry_height=ANativeWindow_getHeight(target_window);
                 geometry_format=ANativeWindow_getFormat(target_window);
                 if(!geometry_code && scale!=ScaleCpu && source.width && source.height) {
-                    const int factor=scale==ScaleSharp?std::max(1,std::min(geometry_width/int(source.width),geometry_height/int(source.height))):1;
-                    geometry_code=ANativeWindow_setBuffersGeometry(target_window,int(source.width)*factor,int(source.height)*factor,WINDOW_FORMAT_RGBA_8888);
+                    const int uw=int(display_scan::upright_width(source.width,source.height));
+                    const int uh=int(display_scan::upright_height(source.width,source.height));
+                    const int factor=scale==ScaleSharp?std::max(1,std::min(geometry_width/uw,geometry_height/uh)):1;
+                    geometry_code=ANativeWindow_setBuffersGeometry(target_window,uw*factor,uh*factor,WINDOW_FORMAT_RGBA_8888);
                 }
                 request_guest_frame_rate(target_window);
                 configured_generation=snapshot->generation();configured_scale=scale;
@@ -453,7 +454,11 @@ void present() {
                     // The window buffer is the guest's own size here whenever the scale is the
                     // default (guest-sized geometry) or a whole multiple of it: then every row is
                     // converted straight across, with no mapping and no margins.
-                    if(int(source.width)==target.width && int(source.height)==target.height &&
+                    if(display_scan::is_landscape_scan(source.width,source.height)) {
+                        display_scan::present_landscape_scan(
+                            static_cast<uint32_t *>(target.bits),target.stride,target.width,target.height,
+                            view,pixels.data(),source.width,source.height,source.stride);
+                    } else if(int(source.width)==target.width && int(source.height)==target.height &&
                        target.stride==target.width) {
                         for(int y=0;y<target.height;++y)
                             convert_row_rgba(static_cast<uint32_t *>(target.bits)+size_t(y)*target.stride,
@@ -973,6 +978,7 @@ jstring touch_command(JNIEnv *env,uint64_t lease,jlong time,jintArray ids,jintAr
     env->GetIntArrayRegion(ids,0,count,id);env->GetIntArrayRegion(phases,0,count,phase);env->GetFloatArrayRegion(xy,0,count*2,coords);
     lt_touch_batch batch=LT_INIT(lt_touch_batch);batch.timestamp_ns=time;batch.count=count;
     const auto view=viewport(width,height);lt_error error=LT_INIT(lt_error);
+    const uint32_t scan_rot=display_scan::scan_rotation(frame.width,frame.height);
     for(jsize i=0;i<count;++i) {
         batch.contacts[i]=lt_contact LT_INIT(lt_contact);batch.contacts[i].id=id[i];batch.contacts[i].phase=phase[i];
         // A finger past the guest's edge (into a letterbox, or off the glass) holds at the nearest edge instead of
@@ -981,7 +987,7 @@ jstring touch_command(JNIEnv *env,uint64_t lease,jlong time,jintArray ids,jintAr
         if(std::isfinite(px) && std::isfinite(py)) {
             px=std::clamp(px,view.left,view.left+view.width);py=std::clamp(py,view.top,view.top+view.height);
         }
-        auto status=lt_map_contact(px,py,view.left,view.top,view.width,view.height,0,&batch.contacts[i].x,&batch.contacts[i].y);
+        auto status=lt_map_contact(px,py,view.left,view.top,view.width,view.height,scan_rot,&batch.contacts[i].x,&batch.contacts[i].y);
         if(status!=LT_OK) {
             const auto cancellation=release_input();
             return string(env,touch_mapping_rejection(status,cancellation));
@@ -1053,17 +1059,16 @@ JNI(motion) jstring JNICALL Java_org_un1box_android_Native_motion(JNIEnv *env,jo
 }
 JNI(capture) jobject JNICALL Java_org_un1box_android_Native_capture(JNIEnv *env,jobject) {
     std::lock_guard<std::mutex> lock(guard);if(!frame.width||!frame.height)return nullptr;
+    const uint32_t uw=display_scan::upright_width(frame.width,frame.height);
+    const uint32_t uh=display_scan::upright_height(frame.width,frame.height);
     jclass bitmap=env->FindClass("android/graphics/Bitmap"),config=env->FindClass("android/graphics/Bitmap$Config");
     auto argb=env->GetStaticObjectField(config,env->GetStaticFieldID(config,"ARGB_8888","Landroid/graphics/Bitmap$Config;"));
     auto create=env->GetStaticMethodID(bitmap,"createBitmap","(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
-    jobject result=env->CallStaticObjectMethod(bitmap,create,jint(frame.width),jint(frame.height),argb);
+    jobject result=env->CallStaticObjectMethod(bitmap,create,jint(uw),jint(uh),argb);
     if(env->ExceptionCheck()||!result)return nullptr;
     AndroidBitmapInfo info;void *data=nullptr;
     if(AndroidBitmap_getInfo(env,result,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||AndroidBitmap_lockPixels(env,result,&data)!=ANDROID_BITMAP_RESULT_SUCCESS)return nullptr;
-    for(uint32_t y=0;y<frame.height;++y)for(uint32_t x=0;x<frame.width;++x) {
-        const uint8_t *src=pixels.data()+y*frame.stride+x*4;auto *dst=static_cast<uint8_t *>(data)+y*info.stride+x*4;
-        dst[0]=src[2];dst[1]=src[1];dst[2]=src[0];dst[3]=255;
-    }
+    display_scan::capture_upright_rgba(static_cast<uint8_t *>(data),info.stride,pixels.data(),frame.width,frame.height,frame.stride);
     AndroidBitmap_unlockPixels(env,result);return result;
 }
 JNI(audio) jint JNICALL Java_org_un1box_android_Native_audio(JNIEnv *env,jobject,jshortArray buffer) {

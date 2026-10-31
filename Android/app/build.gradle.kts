@@ -20,7 +20,7 @@ android {
         buildConfigField("long", "SHUTDOWN_GRACE_MS", "${shutdownGraceMs}L")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += providers.gradleProperty("targetAbis").orElse("arm64-v8a,x86_64").get().split(",") }
-        externalNativeBuild { cmake { arguments += listOf("-DLT_NATIVE_JOBS=" + providers.gradleProperty("nativeJobs").orElse("2").get(), "-DANDROID_STL=c++_shared", "-DLT_PORTABLE_DIR=" + providers.gradleProperty("portableDir").orElse(file("../../Portable").absolutePath).get(), "-DLT_ENGINE_ROOT=" + providers.gradleProperty("engineRoot").orElse("").get(), "-DLIGHTTOUCH_QEMU_SOURCE=" + providers.gradleProperty("qemuSource").orElse("").get()) } }
+        if (!providers.gradleProperty("prebuiltNativeDir").isPresent) externalNativeBuild { cmake { arguments += listOf("-DLT_NATIVE_JOBS=" + providers.gradleProperty("nativeJobs").orElse("2").get(), "-DANDROID_STL=c++_shared", "-DLT_PORTABLE_DIR=" + providers.gradleProperty("portableDir").orElse(file("../../Portable").absolutePath).get(), "-DLT_ENGINE_ROOT=" + providers.gradleProperty("engineRoot").orElse("").get(), "-DLIGHTTOUCH_QEMU_SOURCE=" + providers.gradleProperty("qemuSource").orElse("").get()) } }
     }
     // -Pdebuggable=false makes a debug APK the runtime may compile ahead of time. Phones with the
     // JIT off (GrapheneOS) otherwise interpret a debuggable app's whole UI.
@@ -30,11 +30,15 @@ android {
     buildFeatures { compose = true; aidl = true; buildConfig = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
-    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+    if (!providers.gradleProperty("prebuiltNativeDir").isPresent) externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
     // Guest app-services executables and firmwarekit run from nativeLibraryDir, which holds files only when extracted.
-    packaging { jniLibs { useLegacyPackaging = providers.gradleProperty("mobileServicesArm64").isPresent || providers.gradleProperty("firmwareKitDir").isPresent } }
+    packaging { jniLibs { useLegacyPackaging = providers.gradleProperty("mobileServicesArm64").isPresent || providers.gradleProperty("firmwareKitDir").isPresent || providers.gradleProperty("prebuiltNativeDir").isPresent } }
 }
+providers.gradleProperty("prebuiltNativeDir").orNull?.let { android.sourceSets["main"].jniLibs.srcDir(file(it)) }
+providers.gradleProperty("prebuiltAssetsDir").orNull?.let { android.sourceSets["main"].assets.srcDir(file(it)) }
 dependencies {
+    implementation("org.apache.commons:commons-compress:1.28.0")
+    implementation("org.tukaani:xz:1.10")
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.compose.ui:ui:1.7.8")
     implementation("androidx.compose.foundation:foundation:1.7.8")
@@ -98,18 +102,19 @@ val sourceRevision = providers.gradleProperty("sourceRevision").orElse(
 val sourceReference = providers.gradleProperty("sourceReference").orElse(
     sourceRevision.map { "https://github.com/KlugKlugTG/Un1box/tree/$it" }
 )
-// firmwarekit, the preparer every port shares (-PfirmwareKitDir: scripts/build.sh firmwarekit-android): it and
-// lighttouch-oneshot ship as executables in nativeLibraryDir, with the notices of what it links.
+// firmwarekit, the preparer every port shares (-PfirmwareKitDir: scripts/build.sh firmwarekit-android): it,
+// lighttouch-oneshot and iBoot32Patcher ship as executables in nativeLibraryDir, with the notices of what they link.
 providers.gradleProperty("firmwareKitDir").orNull?.let { input ->
     val kit = file(input)
-    require(listOf("firmwarekit", "lighttouch-oneshot", "licenses/manifest.json").all { kit.resolve(it).isFile }) {
-        "firmwareKitDir must hold firmwarekit, lighttouch-oneshot and licenses/ (scripts/build.sh firmwarekit-android)"
+    require(listOf("firmwarekit", "lighttouch-oneshot", "iBoot32Patcher", "licenses/manifest.json").all { kit.resolve(it).isFile }) {
+        "firmwareKitDir must hold firmwarekit, lighttouch-oneshot, iBoot32Patcher and licenses/ (scripts/build.sh firmwarekit-android)"
     }
     val firmwareKitJniLibs = layout.buildDirectory.dir("generated/firmwareKitJniLibs")
     val firmwareKitNotices = layout.buildDirectory.dir("generated/firmwareKitNotices")
     val stage = tasks.register<Copy>("prepareFirmwareKit") {
         from(kit) { include("firmwarekit"); rename { "libfirmwarekit.so" } }
         from(kit) { include("lighttouch-oneshot"); rename { "liblighttouch_oneshot.so" } }
+        from(kit) { include("iBoot32Patcher"); rename { "libiboot32patcher.so" } }
         into(firmwareKitJniLibs.map { it.dir("arm64-v8a") })
     }
     val notices = tasks.register<Copy>("prepareFirmwareKitNotices") {

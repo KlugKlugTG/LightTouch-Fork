@@ -42,6 +42,12 @@ final class K48Board: Board {
     var systemOptions: SystemEdits.Options {
         var o = SystemEdits.Options(recipe: recipe, version: version)
         o.bluetooth = a4.bluetoothHCI
+        #if os(Android)
+        // On the Android n88 5.1.1 jailbreak boot, BTServer's sandboxed BlueTool keeps restarting, then
+        // AppleSimpleUARTSync panics with "Assertion failed: _hwEnabled". Keep that guest job disabled
+        // for this configuration until the controller survives those restarts.
+        if o.jailbreak && board == "n88ap" && version == "5.1.1" { o.bluetooth = false }
+        #endif
         return o
     }
     let recipe: FirmwareEntry.Recipe, version: String, strategy: String, iboot: Bool, dataProtection: Bool
@@ -96,8 +102,9 @@ final class K48Board: Board {
                 throw FirmwareError(.unsupported, "kboot.bin: no K48KBOOT trailer")
             }
             // boot_args: revision, version, 13 words, then the 256-byte command line (KBoot.build)
+            let imageBytes = Int(le32(b, t + 20))
             let at = Int(le32(b, t + 16)) - Int(le32(b, t + 8)) + 56
-            guard at > 0, at + 256 <= Int(le32(b, t + 20)) else {
+            guard at > 0, at + 256 <= imageBytes, imageBytes <= t else {
                 throw FirmwareError(.unsupported, "kboot.bin: boot_args outside the image")
             }
             let line = String(decoding: b[at..<at + 256].prefix { $0 != 0 }, as: UTF8.self)
@@ -105,6 +112,7 @@ final class K48Board: Board {
             let new = Array((line + " " + jailbreakBootArg).utf8)
             guard new.count < 256 else { throw FirmwareError(.unsupported, "kboot.bin: boot-args too long") }
             b.replaceSubrange(at..<at + 256, with: new + [UInt8](repeating: 0, count: 256 - new.count))
+            _ = try? SandboxPatch.applyLoaded(&b, imageBytes: imageBytes)
             try Data(b).write(to: kboot)
             return kboot.lastPathComponent
         }
@@ -156,7 +164,14 @@ final class K48Board: Board {
             )
         }
         self.helper = helper
-        patcher = K48IBoot.patcher(helper: helper)
+        let patcher = K48IBoot.patcher(helper: helper)
+        if iboot, !FileManager.default.isExecutableFile(atPath: patcher.path) {
+            throw FirmwareError(
+                .internal,
+                "the iPad iBoot chain needs iBoot32Patcher beside \(helper.lastPathComponent) (or FIRMWAREKIT_IBOOT_PATCHER); got \(patcher.path)"
+            )
+        }
+        self.patcher = patcher
         Machines.helper = helper
         guard let hardware = HostRuntime.Board(rawValue: board)?.hardware else {
             throw FirmwareError(.internal, "\(helper.lastPathComponent)'s emulator library has no machine for \(board)")

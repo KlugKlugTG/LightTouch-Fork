@@ -44,6 +44,11 @@ internal class PrepareState {
     /** Copying and checking an IPSW the user chose; empty when idle. */
     var ipswChecking by mutableStateOf("")
     var ipswError by mutableStateOf("")
+    /** Sibling IPSW (`recipe.keybag_ramdisk_from`) when the chosen build lacks public restore-ramdisk keys. */
+    var siblingIpswPath by mutableStateOf("")
+    var siblingIpswFor by mutableStateOf("")
+    var siblingIpswChecking by mutableStateOf("")
+    var siblingIpswError by mutableStateOf("")
     /** A boot ROM whose bytes matched [romFor]'s, and where it came from. */
     var romPath by mutableStateOf("")
     var romFor by mutableStateOf<Bootrom?>(null)
@@ -52,12 +57,19 @@ internal class PrepareState {
     var romError by mutableStateOf("")
     var preparation by mutableStateOf<Bundle?>(null)
     var importError by mutableStateOf("")
+    /** Cydia (`firmwarekit create --jailbreak`), offered from iPhone OS 2.0 on, and its bootstrap's download. */
+    var jailbreak by mutableStateOf(false)
+    var jailbreakError by mutableStateOf("")
+    /** Every bootstrap file is downloaded and matches its SHA-1. */
+    var jailbreakReady by mutableStateOf(false)
     /** Adding the prepared output as a device: the phase shown, and how far it is (negative while unknown). */
     var importPhase by mutableStateOf("")
     var importProgress by mutableFloatStateOf(-1f)
     var showBetas by mutableStateOf(false)
     val firmware get() = catalog.firstOrNull { it.id == firmwareId }
+    val siblingFirmware get() = firmware?.keybagRamdiskFrom?.takeIf { it.isNotEmpty() }?.let { id -> catalog.firstOrNull { it.id == id } }
     val ipswReady get() = ipswPath.isNotEmpty() && ipswFor == firmwareId
+    val siblingReady get() = siblingFirmware == null || (siblingIpswPath.isNotEmpty() && siblingIpswFor == siblingFirmware?.id)
     /** The boot ROM [firmware]'s device starts from; null when it starts from its prepared files. */
     val bootrom get() = firmware?.let { Bootrom.forBoard(it.board) }
     val romReady get() = firmware != null && (bootrom == null || (romPath.isNotEmpty() && romFor == bootrom))
@@ -90,8 +102,9 @@ private fun preparationCost(firmware: CatalogFirmware?) =
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 internal fun PrepareScreen(state: PrepareState, busy: Boolean, preparing: Boolean, onDownload: () -> Unit, onChooseIpsw: () -> Unit,
-                           onChooseRom: () -> Unit, onDownloadRom: () -> Unit, onPrepare: () -> Unit, onChoosePrepared: () -> Unit,
-                           onCancel: () -> Unit, onRetryImport: () -> Unit, onAdvanced: () -> Unit, onClose: () -> Unit) {
+                           onChooseRom: () -> Unit, onDownloadRom: () -> Unit, onPrepare: () -> Unit, onJailbreak: (Boolean) -> Unit,
+                           onChoosePrepared: () -> Unit, onCancel: () -> Unit, onRetryImport: () -> Unit, onAdvanced: () -> Unit, onClose: () -> Unit,
+                           onDownloadSibling: () -> Unit = {}, onChooseSiblingIpsw: () -> Unit = {}) {
     val run = state.preparation?.getString("state")
     val showProgress = preparing || run in listOf("complete", "failed", "cancelled")
     val back = {
@@ -120,7 +133,7 @@ internal fun PrepareScreen(state: PrepareState, busy: Boolean, preparing: Boolea
                     state.step == PrepareStep.DEVICE -> DeviceStep(state, onAdvanced)
                     state.step == PrepareStep.VERSION -> VersionStep(state)
                     !state.preparesHere -> PreparedCopyStep(state, busy, onChoosePrepared)
-                    else -> FilesStep(state, busy, onDownload, onChooseIpsw, onChooseRom, onDownloadRom, onPrepare)
+                    else -> FilesStep(state, busy, onDownload, onChooseIpsw, onChooseRom, onDownloadRom, onPrepare, onJailbreak, onDownloadSibling, onChooseSiblingIpsw)
                 }
                 Spacer(Modifier.height(24.dp))
             }
@@ -219,6 +232,10 @@ private fun VersionStep(state: PrepareState) {
                 if (firmware.id in state.supported) "" else "\nPrepared on a computer, then added here"
             ChoiceRow(null, "iOS ${firmware.label}", detail, true, "prepare_version_${firmware.id}") {
                 state.firmwareId = firmware.id; state.step = PrepareStep.FILES
+                // 1.x cannot be jailbroken: the option goes with the version it was chosen for.
+                if (!CydiaBootstrap.offers(firmware.version)) {
+                    state.jailbreak = false; state.jailbreakReady = false; state.jailbreakError = ""
+                }
             }
         }
     }
@@ -266,10 +283,13 @@ private fun released(firmware: CatalogFirmware): String {
 
 @Composable
 private fun ColumnScope.FilesStep(state: PrepareState, busy: Boolean, onDownload: () -> Unit, onChooseIpsw: () -> Unit, onChooseRom: () -> Unit,
-                                  onDownloadRom: () -> Unit, onPrepare: () -> Unit) {
+                                  onDownloadRom: () -> Unit, onPrepare: () -> Unit, onJailbreak: (Boolean) -> Unit,
+                                  onDownloadSibling: () -> Unit, onChooseSiblingIpsw: () -> Unit) {
     val firmware = state.firmware ?: return
+    val sibling = state.siblingFirmware
     val name = shortProductName(firmware.productType)
     Heading("$name, iOS ${firmware.label}", "Un1box needs Apple's stock IPSW for this version" +
+        (if (sibling != null) ", the iOS ${sibling.label} IPSW for its restore ramdisk" else "") +
         (if (needsBootrom(firmware.board)) ", and the device's boot file." else "."))
     // IPSW
     Card(icon = LtIcons.Layers, title = "iOS firmware (IPSW)", done = state.ipswReady,
@@ -302,6 +322,37 @@ private fun ColumnScope.FilesStep(state: PrepareState, busy: Boolean, onDownload
             }
         }
     }
+    // Sibling IPSW when this build has no public restore-ramdisk key (e.g. iPad 4.3.1-4.3.5 borrow 4.3's ramdisk).
+    if (sibling != null) Card(icon = LtIcons.Layers, title = "Restore ramdisk · iOS ${sibling.label} IPSW", done = state.siblingReady,
+        detail = if (state.siblingReady) "${java.io.File(state.siblingIpswPath).name} · verified" else "${sibling.fileName} · ${sibling.bytes / 1_000_000} MB") {
+        val downloadingSibling = IpswDownload.running && IpswDownload.firmwareId == sibling.id
+        when {
+            state.siblingReady -> TextButton(onClick = onChooseSiblingIpsw, enabled = !busy) { Text("Use a different file") }
+            downloadingSibling -> {
+                Text(IpswDownload.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(8.dp))
+                if (IpswDownload.progress >= 0f) LinearProgressIndicator(progress = { IpswDownload.progress }, Modifier.fillMaxWidth())
+                else LinearProgressIndicator(Modifier.fillMaxWidth())
+                TextButton(onClick = { IpswDownload.cancel() }) { Text("Cancel download") }
+            }
+            state.siblingIpswChecking.isNotEmpty() -> {
+                Text(state.siblingIpswChecking, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(8.dp)); LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+            else -> {
+                val error = state.siblingIpswError.ifEmpty { IpswDownload.status.takeIf { IpswDownload.firmwareId == sibling.id } ?: "" }
+                if (error.isNotEmpty()) Text(error, Modifier.padding(bottom = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onDownloadSibling, enabled = !busy && !IpswDownload.running, modifier = Modifier.testTag("prepare_download_sibling")) {
+                        Icon(LtIcons.Download, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Download")
+                    }
+                    OutlinedButton(onClick = onChooseSiblingIpsw, enabled = !busy, modifier = Modifier.testTag("prepare_choose_sibling_ipsw")) { Text("Choose a file") }
+                }
+                Text("iOS ${firmware.label} has no public key for its restore ramdisk, so encryption setup uses the ramdisk from iOS ${sibling.label} (${sibling.build}).",
+                    Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
     // Boot file: which one the device starts from, always shown.
     val rom = state.bootrom
     if (rom == null) Card(icon = LtIcons.Chip, title = "Boot file", done = true,
@@ -324,12 +375,43 @@ private fun ColumnScope.FilesStep(state: PrepareState, busy: Boolean, onDownload
             }
         }
     }
+    // Cydia: afc2, Cydia and Substrate, in the same pass over the system volume.
+    if (CydiaBootstrap.offers(firmware.version)) Card(icon = LtIcons.Puzzle, title = "Cydia (jailbreak)",
+        done = state.jailbreak && state.jailbreakReady,
+        detail = if (state.jailbreak) "Cydia, apt and dpkg in the system volume" else "Optional. iOS ${firmware.label} can be prepared jailbroken.") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Jailbreak with Cydia", style = MaterialTheme.typography.titleSmall)
+                Text("Adds Cydia, apt and dpkg, ${if (firmware.version.startsWith("3.")) "and afc2" else "Substrate (the tweak loader) and afc2"}, which serves the whole file system over USB. The first start finishes the install.",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Switch(checked = state.jailbreak, onCheckedChange = onJailbreak, enabled = !busy && !CydiaBootstrap.running,
+                modifier = Modifier.testTag("prepare_jailbreak"))
+        }
+        when {
+            CydiaBootstrap.running -> {
+                Spacer(Modifier.height(8.dp))
+                Text(CydiaBootstrap.status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(8.dp))
+                if (CydiaBootstrap.progress >= 0f) LinearProgressIndicator(progress = { CydiaBootstrap.progress }, Modifier.fillMaxWidth())
+                else LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
+            state.jailbreakError.isNotEmpty() -> Text(state.jailbreakError, Modifier.padding(top = 8.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            state.jailbreak && state.jailbreakReady -> Text("Downloaded and checked.", Modifier.padding(top = 8.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else -> Text("Its files (about 8 MB, each checked against its SHA-1) are downloaded when you turn this on.",
+                Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
     Spacer(Modifier.height(12.dp))
     val cost = preparationCost(firmware)
     Text("Preparing runs on this phone, takes ${cost.time} and needs about ${cost.space} free. Un1box's guest tools are added for you.",
         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     Spacer(Modifier.height(20.dp))
-    Button(onClick = onPrepare, enabled = !busy && state.ipswReady && state.romReady && state.ipswChecking.isEmpty(),
+    Button(onClick = onPrepare,
+        enabled = !busy && state.ipswReady && state.siblingReady && state.romReady &&
+            state.ipswChecking.isEmpty() && state.siblingIpswChecking.isEmpty() && (!state.jailbreak || state.jailbreakReady),
         modifier = Modifier.align(Alignment.CenterHorizontally).height(52.dp).testTag("start_preparation"), contentPadding = PaddingValues(horizontal = 32.dp)) {
         Text("Prepare device", style = MaterialTheme.typography.titleMedium)
     }

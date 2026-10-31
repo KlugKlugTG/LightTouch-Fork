@@ -135,6 +135,17 @@ default:  // the root alone, or help
         if command.glTest { entry.recipe?.options["gl_test"] = true }
         if command.skipSetup { entry.recipe?.options["skip_setup"] = true }
         if command.jailbreak { entry.recipe?.options["jailbreak"] = true }
+        let sibling: (entry: FirmwareEntry, ipsw: URL)? =
+            if let siblingEntryPath = command.siblingEntry {
+                (try FirmwareEntry.load(from: fileURL(siblingEntryPath)), fileURL(command.siblingIpsw ?? ""))
+            } else if let siblingIpswPath = command.siblingIpsw,
+                let siblingId = entry.recipe?.keybagRamdiskFrom,
+                let catalogPath = command.catalog
+            {
+                (try FirmwareEntry.load(id: siblingId, fromCatalog: fileURL(catalogPath)), fileURL(siblingIpswPath))
+            } else {
+                nil
+            }
         options = .init(
             entry: entry,
             ipsw: fileURL(command.ipsw),
@@ -143,9 +154,7 @@ default:  // the root alone, or help
             helper: helper,
             guestTools: command.guestTools.map(fileURL) ?? bundled ?? resources.appendingPathComponent("guest-tools"),
             cache: command.cache.map(fileURL),
-            sibling: try command.siblingEntry.map {
-                (try FirmwareEntry.load(from: fileURL($0)), fileURL(command.siblingIpsw ?? ""))
-            }
+            sibling: sibling
         )
         options.stopAfterVolumes = command.stopAfter == .volumes
         options.builtListing = command.builtListing
